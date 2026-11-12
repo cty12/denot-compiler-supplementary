@@ -1,0 +1,2252 @@
+#!/usr/bin/env python3
+"""Measure the code of the compiler-correctness proofs of the artifact, in
+lexical tokens (the default) or in lines (--lines).
+
+Run from the root of the artifact:  python3 loc.py --artifact
+(or `make tables`), which prints Tables 1 and 2 of the paper.
+
+This is the script that measures the full development; the artifact holds
+only FPC's part of it (the import closure of agda/FPC/All.agda and
+agda/AllScott.agda), so it is run with --artifact.  In that mode the
+groups of modules that belong to the other parts are empty and skipped,
+and the checks about them are skipped too; the checks about FPC still
+run (every module is in exactly one group, no proof reaches another's
+modules, the audit surface imports no proof module).
+
+A code line is a line that is not blank, not a comment ({- -} blocks,
+-- line comments) and not part of an import statement (`import` or
+`open import`, with its continuation lines): imports depend on how
+finely a development is split into modules, not on its content.
+
+The tables count the lexical tokens of the code lines, because a count of
+lines depends on layout and a count of lexical tokens does not; each
+total is also given in lines.  The lexical tokens are those of Agda's
+lexer, approximately: the whitespace-separated words, split further at
+Agda's delimiters, each of which is a token by itself: a parenthesis or
+brace ( ) { } (and {{ }}), `;`, `@`, and a `.` that starts a word (a dot
+pattern or an irrelevant binder, as in `.(x : A)`).  So an identifier or
+an operator, however many Unicode characters it has, is one token when
+whitespace separates it (`⟦_⟧₃`, `ρ'`, `→`, `＝`), and so is a qualified
+name (`S.Env`).
+
+A proof's total is its own modules plus the shared modules it reaches
+(transitively, through imports) that are not reached by all four of the
+graph model, abstract machines, clocked interpreters and reduction
+semantics; shared modules reached by all four (FPC's languages and
+passes) are counted in no total.  Language-independent infrastructure is
+counted separately (Table 2), for each proof the infrastructure modules
+it reaches.  A module X.agda and its proof half proof/X.agda are one
+unit.  For the Scott column, the infrastructure is agda/Framework/Scott/
+and agda/proof/Framework/Scott/ (domain theory on TypeTopology), and
+TypeTopology's domain theory is the modules under DomainTheory/ and
+Lifting/ of vendor/TypeTopology/source/ that the column imports; the
+rest of TypeTopology it imports (its foundations) is counted for no
+column.
+"""
+import glob, os, re, sys
+
+# --artifact: run on the exported artifact (see the usage above)
+ARTIFACT = '--artifact' in sys.argv[1:]
+
+A = 'agda/'
+# the ISWIM pipelines: the typed one in agda/ISWIM/, the untyped one in
+# agda/ISWIM/Untyped/
+I = A + 'ISWIM/'
+U = I + 'Untyped/'
+
+L, C, PC = I + 'Language/', I + 'Compiler/', I + 'proof/Compiler/'
+G, GP, GC = I + 'Semantics/Graph/', I + 'proof/Semantics/Graph/', I + 'proof/Correctness/Graph/'
+O, OP, OC = I + 'Semantics/CEK/', I + 'proof/Semantics/CEK/', I + 'proof/Correctness/CEK/'
+F, FP, FC = I + 'Semantics/Interp/', I + 'proof/Semantics/Interp/', I + 'proof/Correctness/Interp/'
+RD, RP, RC = I + 'Semantics/Reduction/', I + 'proof/Semantics/Reduction/', I + 'proof/Correctness/Reduction/'
+GE, GEP, GEC = I + 'Semantics/GraphErr/', I + 'proof/Semantics/GraphErr/', I + 'proof/Correctness/GraphErr/'
+AP, GEA = I + 'proof/Adequacy/', I + 'proof/Adequacy/GraphErr/'
+# the modules that FPC and the ISWIM pipelines share, directly under agda/:
+# the primitives and registers, the graph model's meaning of the
+# primitives, the observations and the frameworks' instances at them
+SL = A + 'Language/'
+SG, SGP = A + 'Semantics/Graph/', A + 'proof/Semantics/Graph/'
+SO, SOP = A + 'Semantics/CEK/', A + 'proof/Semantics/CEK/'
+SF, SFP = A + 'Semantics/Interp/', A + 'proof/Semantics/Interp/'
+SRD = A + 'Semantics/Reduction/'
+W, WP = A + 'Framework/', A + 'proof/Framework/'
+MU = A + 'FPC/'
+MUP = MU + 'proof/'
+# FPC's names of the languages that the ISWIM pipeline calls Clos2–Clos5
+# (the names of the paper)
+MU_LANG = {'ISWIM': 'FPC', 'Clos2': 'Clos', 'Clos3': 'EnvClos', 'Clos4': 'PairClos', 'Clos5': 'GlobalFun'}
+
+
+def ml(x):
+    """FPC's name of the ISWIM pipeline's language x."""
+    return MU_LANG.get(x, x)
+
+
+
+# the Scott-domain column (needs TypeTopology; see --scott)
+SCOTT = [A + 'AllScott.agda', W + 'Scott/*.agda', WP + 'Scott/*.agda', A + 'Semantics/Scott/*.agda',
+         MU + 'Semantics/ScottDomains/*.agda', MU + 'proof/Semantics/ScottDomains/*.agda',
+         MU + 'proof/Correctness/ScottDomains/*.agda', MU + 'Theorems/CorrectWrtScottDomains.agda',
+         MU + 'proof/Adequacy/ScottDomains/*.agda', MU + 'Theorems/ScottDomainsAdequateWrtClockedInterpreters.agda']
+
+
+def scott_files():
+    return {f for p in SCOTT for f in glob.glob(p)}
+
+
+SCOTT_FILES = scott_files()
+
+
+def u(p):
+    """The path p of agda/ISWIM/, in the untyped pipeline."""
+    return U + p[len(I):]
+
+
+# the sides of the four proofs that the five compare, all of them, and their
+# adequacy proofs: the typed pipeline (the main one) and the untyped one
+TYPED = dict(sides=('den', 'op', 'ck', 'red'), gerr='gerr', adeq='adeq', gadeq='gadeq',
+             shared=('shared',), thm={'den': I + 'Theorems/Denotational.agda',
+                                      'op': I + 'Theorems/Simulation.agda',
+                                      'ck': I + 'Theorems/Interpreter.agda',
+                                      'red': I + 'Theorems/Reduction.agda',
+                                      'adeq': I + 'Theorems/Adequacy.agda',
+                                      'gerr': I + 'Theorems/GraphErrors.agda'},
+             exp='exp', name='typed pipeline')
+UNTYPED = dict(sides=('uden', 'uop', 'uck', 'ured'), gerr='ugerr', adeq='uadeq', gadeq='ugadeq',
+               shared=('shared', 'ushared'),
+               thm={'uden': U + 'Theorems/Denotational.agda', 'uop': U + 'Theorems/Simulation.agda',
+                    'uck': U + 'Theorems/Interpreter.agda', 'ured': U + 'Theorems/Reduction.agda',
+                    'uadeq': U + 'Theorems/Adequacy.agda', 'ugerr': U + 'Theorems/GraphErrors.agda'},
+               exp='uexp', name='untyped pipeline')
+BOTH = 'den+uden'
+
+# the statements of the assurance (side 'assure'), not in the totals
+ASSURE_THM = I + 'Theorems/X86Erasure.agda'
+
+# import bundles: imports only, looked through (see above)
+BUNDLES = {W + 'GraphModel/Prelude.agda', W + 'GraphModel/ErrorPrelude.agda',
+           WP + 'GraphModel/Prelude.agda', WP + 'GraphModel/ErrorPrelude.agda'}
+
+# (side, group, glob patterns)
+GROUPS = [
+    # the languages, the passes and the lemmas about their output that the
+    # proofs use (cast insertion on closed programs, hoist's references,
+    # select's labels and frames, simplify keeps programs closed), and the
+    # observations.  Those not used by all four proofs of a pipeline are
+    # counted in each proof that uses them (see main).  Untyped ISWIM, the
+    # primitives, simplify and the observations are used by both
+    # pipelines; untyped X86 is the untyped pipeline's target.
+    ('shared', 'syntax, languages, compiler passes',
+     [SL + '*.agda', L + '*.agda', L + 'Typed/*.agda', C + '*.agda', PC + '*.agda',
+      A + 'Semantics/Observation.agda']),
+    ('ushared', 'syntax, languages, compiler passes',
+     [u(L) + '*.agda', u(C) + '*.agda', u(PC) + '*.agda', L + 'X86.agda']),
+
+    # assurance, not in the totals: with the types erased, select emits the
+    # instructions of select into untyped X86 (the typed pipeline's select
+    # before X86ᵀ, Compiler/SelectX86.agda)
+    ('assure', 'erasure: select emits the instructions of select into untyped X86',
+     [L + 'Typed/X86Erase.agda', C + 'SelectX86.agda', PC + 'SelectErase.agda']),
+    # and erasing X86ᵀ keeps the meaning of every program, in the CEK
+    # machines (a simulation of the X86ᵀ machine by the X86 machine)
+    ('assure', 'erasure keeps the meaning of every X86ᵀ program (CEK machines)',
+     [I + 'proof/Assurance/*.agda']),
+
+    # language-independent infrastructure: not in the totals (see main)
+    ('infra', 'abstract binding trees',
+     [W + 'abt/AbstractBindingTree.agda', W + 'abt/GSubst.agda', W + 'abt/ScopedTuple.agda',
+      WP + 'abt/ScopedTuple.agda', W + 'abt/Sig.agda', W + 'abt/Var.agda',
+      W + 'Syntax/SigUtil.agda', W + 'Syntax/SyntaxUtil.agda']),
+    ('infra', 'syntax lemmas (renaming, scoping, uses, substitution), list lookups',
+     [W + 'Syntax/Uses.agda', W + 'Syntax/Scope.agda', W + 'Syntax/Rename.agda', W + 'Syntax/Subst.agda',
+      W + 'Syntax/ScopeDec.agda', W + 'Syntax/Kit.agda', W + 'Syntax/TypedSubst.agda', WP + 'Syntax/*.agda',
+      W + 'ListUtil.agda', WP + 'ListUtil.agda']),
+    ('infra', 'base types, logical equivalence', [W + 'Primitives.agda', W + 'PrimitivesDec.agda', W + 'Iff.agda', WP + 'Iff.agda']),
+    ('infra', 'typed indices, lookup in typed lists, vectors (collecting, selecting, projecting)',
+     [W + 'Membership.agda', W + 'Lookup.agda', WP + 'Lookup.agda', W + 'VecUtil.agda', WP + 'VecUtil.agda',
+      W + 'VecSelect.agda', WP + 'VecSelect.agda', WP + 'VecProj.agda']),
+    ('infra', 'denotational framework',
+     [W + 'GraphModel/SetsAsPredicates.agda', WP + 'GraphModel/SetsAsPredicates.agda',
+      W + 'GraphModel/DOpSig.agda', WP + 'GraphModel/DOpSig.agda',
+      W + 'GraphModel/Env.agda', WP + 'GraphModel/Env.agda',
+      WP + 'GraphModel/Semantics.agda', WP + 'GraphModel/DenotProperties.agda',
+      W + 'abt/Fold2.agda', WP + 'GraphModel/RenameSem.agda',
+      WP + 'GraphModel/SemanticsUses.agda']),
+    # the graph model is three groups, so that each semantic algebra is
+    # charged only for the operators it uses: the values, their consistency
+    # and the machinery for any operators (continuity, Good, the properties
+    # of whole terms), with the operators both algebras share unchanged
+    # (constants, components of a tuple of results); the operators of the
+    # graph model; and the error monad of the graph model with errors
+    ('infra', 'graph model: values, consistency, machinery for any operators',
+     [W + 'GraphModel/Domain.agda', WP + 'GraphModel/Domain.agda',
+      W + 'GraphModel/OpsBase.agda', WP + 'GraphModel/OpsBase.agda',
+      WP + 'GraphModel/ContinuityBase.agda', WP + 'GraphModel/SemanticsCore.agda',
+      WP + 'GraphModel/DomainUtilBase.agda']),
+    ('infra', 'graph model: its operators',
+     [W + 'GraphModel/Ops.agda', WP + 'GraphModel/Ops.agda',
+      WP + 'GraphModel/Continuity.agda', WP + 'GraphModel/SemanticsUtil.agda',
+      WP + 'GraphModel/DomainUtil.agda', WP + 'GraphModel/Strict.agda', WP + 'GraphModel/Laws.agda']),
+    ('infra', 'graph model with errors: the error monad, its operators and laws',
+     [W + 'GraphModel/ErrorMonad.agda', WP + 'GraphModel/ErrorMonad.agda']),
+    ('infra', 'graph model: semantics of intrinsically typed syntax',
+     [W + 'GraphModel/Typed*.agda', WP + 'GraphModel/Typed*.agda']),
+    ('infra', 'small-step framework: transition systems, simulations',
+     [W + 'Smallstep.agda', WP + 'Smallstep.agda', WP + 'Simulation.agda', WP + 'Both.agda']),
+    ('infra', 'reduction framework: reduction semantics, simulations between them',
+     [W + 'Reduction.agda', WP + 'Reduction.agda', W + 'ReductionVec.agda', WP + 'ReductionVec.agda']),
+    ('infra', 'clocked big-step framework', [W + 'Clocked.agda', WP + 'Clocked.agda']),
+    # runs of a step function from any state, for the logical relations of
+    # adequacy
+    ('infra', 'runs of a step function from any state', [WP + 'Runs.agda']),
+
+    # simplify's syntactic lemmas (SimplifyFacts) are used by all ten of its
+    # proofs (five columns, two pipelines), so they are counted in the
+    # simplify row of each column
+    ('den+op+ck+red+gerr+uden+uop+uck+ured+ugerr', 'simplify', [PC + 'SimplifyFacts.agda']),
+
+    # --- the plain graph model ------------------------------------------------
+    # the meaning of the primitives (Prim.agda) is here, as prim? is in each
+    # machine and interpreter
+    (BOTH, 'semantics of the languages',
+     [SG + 'Prim.agda', SGP + 'Prim.agda', G + 'ISWIM.agda', GP + 'ISWIM.agda', GP + 'ISWIMContinuous.agda']),
+    ('den', 'semantics of the languages', [G + 'Typed/*.agda', GP + 'Typed/*.agda']),
+    (BOTH, 'simplify', [GC + 'SimplifyCorrect.agda']),
+    ('den', 'cast insertion', [GC + 'CastCorrect.agda']),
+    ('den', 'CC: capture', [GC + 'CaptureCorrect.agda']),
+    ('den', 'CC: prune', [GC + 'PruneCorrect.agda']),
+    ('den', 'CC: concretize', [GC + 'ConcretizeCorrect.agda']),
+    ('den', 'CC: split', [GC + 'Split*.agda']),
+    ('den', 'CC: hoist', [GC + 'HoistCorrect.agda']),
+    ('den', 'rco', [GC + 'RCOCorrect.agda']),
+    ('den', 'lift locals', [GC + 'LiftLocalsCorrect.agda']),
+    ('den', 'explicate control', [GC + 'ExplicateCorrect.agda']),
+    ('den', 'select instructions', [GC + 'SelectCorrect.agda']),
+    ('den', 'composition', [GC + 'CompilerCorrect.agda']),
+
+    # --- CEK machines + simulations ------------------------------------------
+    # with the framework at this compiler's observations (Smallstep.agda,
+    # Simulation.agda).  The machines of Clos5ᵀ (whose values Impᵀ's uses),
+    # Impᵀ, CFGᵀ and X86ᵀ, and the framework instances, are shared with the
+    # reduction proof ('op+red': counted in both columns).  The machine of
+    # untyped X86 and its values are the untyped pipeline's.
+    ('op+uop', 'semantics of the languages', [O + 'ISWIM.agda']),
+    ('op+red+uop+ured', 'semantics of the languages',
+     [SO + 'Smallstep.agda', SOP + 'Smallstep.agda', SOP + 'Simulation.agda']),
+    ('uop+ured', 'semantics of the languages', [O + 'Values.agda', O + 'X86.agda']),
+    ('op', 'semantics of the languages',
+     [O + 'Typed/ISWIM.agda', O + 'Typed/Clos2.agda', O + 'Typed/Clos3.agda', O + 'Typed/Clos4.agda']),
+    ('op+red', 'semantics of the languages',
+     [O + 'Typed/Clos5.agda', O + 'Typed/Imp.agda', O + 'Typed/CFG.agda', O + 'Typed/X86.agda']),
+    # what several pass proofs share: Lock, the steps of project (Common), and
+    # the Clos5ᵀ machine on atoms (Clos5Common, rco and lift locals)
+    ('op', 'lemmas shared by the passes', [OC + 'Common.agda', OC + 'Clos5Common.agda']),
+    ('op+uop', 'simplify', [OC + 'SimplifySim.agda']),
+    # with 48 lines of list and primitive lemmas copied from adequacy, so
+    # that the CEK proof does not import it (CastSimLemmas)
+    ('op', 'cast insertion', [OC + 'CastSim.agda', OC + 'CastSimLemmas.agda']),
+    ('op', 'CC: capture', [OC + 'CaptureSim.agda']),
+    ('op', 'CC: prune', [OC + 'PruneSim.agda']),
+    ('op', 'CC: concretize', [OC + 'ConcretizeSim.agda']),
+    ('op', 'CC: split', [OC + 'SplitSim.agda']),
+    ('op', 'CC: hoist', [OC + 'HoistSim.agda']),
+    ('op', 'rco', [OC + 'RCOSim.agda']),
+    ('op', 'lift locals', [OC + 'LiftLocalsSim.agda']),
+    # explicate control and select instructions are between the machines of
+    # first-order languages, and are shared with the reduction proof
+    ('op+red', 'explicate control', [OC + 'ExplicateSim.agda']),
+    ('op+red', 'select instructions', [OC + 'SelectSim.agda']),
+    ('op', 'composition', [OC + 'PipelineSim.agda']),
+
+    # --- clocked interpreters + value relations --------------------------------
+    # with the framework at this compiler's observations (Clock.agda)
+    ('ck+uck', 'semantics of the languages', [F + 'ISWIM.agda', SF + 'Clock.agda', SFP + 'Clock.agda']),
+    ('ck', 'semantics of the languages', [F + 'Typed/*.agda', FP + 'Typed/*.agda']),
+    ('ck+uck', 'simplify', [FC + 'SimplifyFuel.agda']),
+    ('ck', 'cast insertion', [FC + 'CastFuel.agda']),
+    ('ck', 'CC: capture', [FC + 'CaptureFuel.agda']),
+    ('ck', 'CC: prune', [FC + 'PruneFuel.agda']),
+    ('ck', 'CC: concretize', [FC + 'ConcretizeFuel.agda']),
+    ('ck', 'CC: split', [FC + 'SplitFuel.agda']),
+    ('ck', 'CC: hoist', [FC + 'HoistFuel.agda']),
+    ('ck', 'rco', [FC + 'RCOFuel.agda']),
+    ('ck', 'lift locals', [FC + 'LiftLocalsFuel.agda']),
+    ('ck', 'explicate control', [FC + 'ExplicateFuel.agda']),
+    ('ck', 'select instructions', [FC + 'SelectFuel.agda']),
+    ('ck', 'composition', [FC + 'CompilerFuel.agda']),
+
+    # --- reduction semantics + simulations -------------------------------------
+    # reduction semantics (substitution) for the languages with binders, and
+    # the framework at this compiler's observations (Smallstep.agda)
+    ('red+ured', 'semantics of the languages', [RD + 'ISWIM.agda', SRD + 'Smallstep.agda']),
+    ('red', 'semantics of the languages', [RD + 'Typed/*.agda', RP + 'Typed/*.agda']),
+    ('red+ured', 'simplify', [RC + 'SimplifyRed.agda']),
+    ('red', 'cast insertion', [RC + 'CastRed.agda']),
+    ('red', 'CC: capture', [RC + 'CaptureRed.agda']),
+    ('red', 'CC: prune', [RC + 'PruneRed.agda']),
+    ('red', 'CC: concretize', [RC + 'ConcretizeRed.agda']),
+    ('red', 'CC: split', [RC + 'SplitRed.agda']),
+    ('red', 'CC: hoist', [RC + 'HoistRed.agda']),
+    ('red', 'rco', [RC + 'RCORed.agda']),
+    ('red', 'lift locals', [RC + 'LiftLocalsRed.agda']),
+    ('red', 'composition', [RC + 'PipelineRed.agda']),
+
+    # --- the graph model with errors -------------------------------------------
+    ('gerr+ugerr', 'semantics of the languages',
+     [GE + 'Prim.agda', GEP + 'Prim.agda', GE + 'ISWIM.agda', GEP + 'ISWIM.agda']),
+    ('gerr', 'semantics of the languages', [GE + 'Typed/*.agda', GEP + 'Typed/*.agda']),
+    ('gerr+ugerr', 'simplify', [GEC + 'SimplifyCorrect.agda']),
+    ('gerr', 'cast insertion', [GEC + 'CastCorrect.agda']),
+    ('gerr', 'CC: capture', [GEC + 'CaptureCorrect.agda']),
+    ('gerr', 'CC: prune', [GEC + 'PruneCorrect.agda']),
+    ('gerr', 'CC: concretize', [GEC + 'ConcretizeCorrect.agda']),
+    ('gerr', 'CC: split', [GEC + 'Split*.agda']),
+    ('gerr', 'CC: hoist', [GEC + 'HoistCorrect.agda']),
+    ('gerr', 'rco', [GEC + 'RCOCorrect.agda']),
+    ('gerr', 'lift locals', [GEC + 'LiftLocalsCorrect.agda']),
+    ('gerr', 'explicate control', [GEC + 'ExplicateCorrect.agda']),
+    ('gerr', 'select instructions', [GEC + 'SelectCorrect.agda']),
+    ('gerr', 'composition', [GEC + 'CompilerCorrect.agda']),
+
+    # --- adequacy ----------------------------------------------------------------
+    # of the graph model: ISWIM is that of both pipelines; X86ᵀ is direct
+    ('adeq+uadeq', 'ISWIM', [AP + 'Common.agda', AP + 'Soundness.agda', AP + 'LogRel.agda', AP + 'ISWIM.agda']),
+    ('adeq', 'Clos5', [AP + 'Clos5*.agda']),
+    ('adeq', 'X86ᵀ', [AP + 'X86*.agda']),
+    # that the table of compile-x86 M is consistent and holds each
+    # definition's code (as Clos5ᵀ's, from hoist-older)
+    ('adeq', 'well-formedness of compiled programs', [AP + 'X86Compiled.agda']),
+    ('adeq', 'end to end', [AP + 'EndToEnd.agda']),
+    # of the graph model with errors: X86ᵀ is direct; its Clos5ᵀ adequacy is
+    # derived from the simulation of the CEK column, in its end to end
+    # (GraphErr/EndToEnd)
+    ('gadeq+ugadeq', 'ISWIM', [GEA + 'Soundness.agda', GEA + 'LogRel.agda', GEA + 'ISWIM.agda']),
+    ('gadeq', 'X86ᵀ', [GEA + 'X86*.agda']),
+    ('gadeq+ugadeq', 'end to end', [GEA + 'Agree.agda']),
+    ('gadeq', 'end to end', [GEA + 'EndToEnd.agda']),
+    ('gadeq+ugadeq', 'simplify through the ISWIM machine', [GEA + 'Simplify.agda']),
+
+    ('examples', 'examples', [PC + 'Examples/*.agda']),
+
+    # not in the totals: the public theorem statements (see the audit-surface
+    # table)
+    ('thm', 'theorem statements', [I + 'Theorems/*.agda']),
+
+    # --- the untyped pipeline ------------------------------------------------
+    ('uden', 'semantics of the languages',
+     [u(G) + 'Frames.agda', u(G) + 'X86.agda', u(GP) + 'X86.agda', u(G) + 'Clos2Iswim.agda', u(GP) + 'Clos2Iswim.agda', u(G) + 'Clos3Iswim.agda', u(GP) + 'Clos3Iswim.agda',
+      u(G) + 'Clos4Iswim.agda', u(GP) + 'Clos4Iswim.agda', u(G) + 'Clos5Iswim.agda',
+      u(GP) + 'Clos5IswimContinuous.agda', u(G) + 'Imp.agda', u(G) + 'ImpK.agda', u(G) + 'CFG.agda']),
+    ('uden', 'CC: capture', [u(GC) + 'CaptureCorrect.agda']),
+    ('uden', 'CC: prune', [u(GC) + 'PruneCorrect.agda']),
+    ('uden', 'CC: concretize', [u(GC) + 'ConcretizeCorrect.agda']),
+    ('uden', 'CC: split',
+     [u(GC) + 'SplitFiniteCommon.agda', u(GC) + 'SplitFiniteRel.agda', u(GC) + 'SplitApp.agda',
+      u(GC) + 'SplitPreserve.agda', u(GC) + 'SplitReflectFinite.agda']),
+    ('uden', 'CC: hoist', [u(GC) + 'HoistCorrect.agda']),
+    ('uden', 'rco', [u(GC) + 'RCOCorrect.agda']),
+    # against the continuation-passing semantics of Imp; against the direct
+    # one, see 'uexp'
+    ('uden', 'lift locals', [u(GC) + 'LiftLocalsCommon.agda', u(GC) + 'LiftLocalsCorrectK.agda']),
+    ('uden', 'explicate control', [u(GC) + 'ExplicateCommon.agda', u(GC) + 'ExplicateCorrectK.agda']),
+    ('uden', 'select instructions', [u(GC) + 'SelectCorrect.agda']),
+    ('uden', 'composition', [u(GC) + 'CompilerCorrect.agda']),
+    ('uop', 'semantics of the languages',
+     [u(O) + 'Clos2.agda', u(O) + 'Clos3.agda', u(O) + 'Clos4.agda', u(O) + 'Clos5.agda']),
+    ('uop+ured', 'semantics of the languages', [u(O) + 'Imp.agda', u(O) + 'CFG.agda']),
+    ('uop', 'CC: capture', [u(OC) + 'CaptureSim.agda']),
+    ('uop', 'CC: prune', [u(OC) + 'PruneSim.agda']),
+    ('uop', 'CC: concretize', [u(OC) + 'ConcretizeSim.agda']),
+    ('uop', 'CC: split', [u(OC) + 'SplitSim.agda']),
+    ('uop', 'CC: hoist', [u(OC) + 'HoistSim.agda']),
+    ('uop', 'rco', [u(OC) + 'RCOSim.agda']),
+    ('uop', 'lift locals', [u(OC) + 'LiftLocalsSim.agda']),
+    ('uop+ured', 'explicate control', [u(OC) + 'ExplicateSim.agda']),
+    ('uop+ured', 'select instructions', [u(OC) + 'SelectSim.agda']),
+    ('uop', 'composition', [u(OC) + 'CompilerSim.agda', u(OC) + 'CompilerX86Sim.agda']),
+    ('ured', 'semantics of the languages', [u(RD) + '*.agda', u(RP) + '*.agda']),
+    ('ured', 'CC: capture', [u(RC) + 'CaptureRed.agda']),
+    ('ured', 'CC: prune', [u(RC) + 'PruneRed.agda']),
+    ('ured', 'CC: concretize', [u(RC) + 'ConcretizeRed.agda']),
+    ('ured', 'CC: split', [u(RC) + 'SplitRed.agda']),
+    ('ured', 'CC: hoist', [u(RC) + 'HoistRed.agda']),
+    ('ured', 'rco', [u(RC) + 'RCORed.agda']),
+    ('ured', 'lift locals', [u(RC) + 'LiftLocalsRed.agda']),
+    ('ured', 'composition', [u(RC) + 'CompilerRed.agda', u(RC) + 'CompilerX86Red.agda']),
+    ('uck', 'semantics of the languages', [u(F) + '*.agda']),
+    ('uck', 'CC: capture', [u(FC) + 'CaptureFuel.agda']),
+    ('uck', 'CC: prune', [u(FC) + 'PruneFuel.agda']),
+    ('uck', 'CC: concretize', [u(FC) + 'ConcretizeFuel.agda']),
+    ('uck', 'CC: split', [u(FC) + 'SplitFuel.agda']),
+    ('uck', 'CC: hoist', [u(FC) + 'HoistFuel.agda']),
+    ('uck', 'rco', [u(FC) + 'RCOFuel.agda']),
+    ('uck', 'lift locals', [u(FC) + 'LiftLocalsFuel.agda']),
+    ('uck', 'explicate control', [u(FC) + 'ExplicateFuel.agda']),
+    ('uck', 'select instructions', [u(FC) + 'SelectFuel.agda']),
+    ('uck', 'composition', [u(FC) + 'CompilerFuel.agda']),
+    ('ugerr', 'semantics of the languages', [u(GE) + '*.agda', u(GEP) + '*.agda']),
+    ('ugerr', 'CC: capture', [u(GEC) + 'CaptureCorrect.agda']),
+    ('ugerr', 'CC: prune', [u(GEC) + 'PruneCorrect.agda']),
+    ('ugerr', 'CC: concretize', [u(GEC) + 'ConcretizeCorrect.agda']),
+    ('ugerr', 'CC: split', [u(GEC) + 'Split*.agda']),
+    ('ugerr', 'CC: hoist', [u(GEC) + 'HoistCorrect.agda']),
+    ('ugerr', 'rco', [u(GEC) + 'RCOCorrect.agda']),
+    ('ugerr', 'lift locals', [u(GEC) + 'LiftLocalsCorrect.agda']),
+    ('ugerr', 'explicate control', [u(GEC) + 'ExplicateCorrect.agda']),
+    ('ugerr', 'select instructions', [u(GEC) + 'SelectCorrect.agda']),
+    ('ugerr', 'composition', [u(GEC) + 'CompilerCorrect.agda']),
+    ('uadeq', 'Clos5', [u(AP) + 'Clos5Common.agda', u(AP) + 'Clos5Soundness.agda', u(AP) + 'Clos5LogRel.agda',
+                        u(AP) + 'Clos5.agda']),
+    ('uadeq', 'X86',
+     [u(AP) + 'X86Common.agda', u(AP) + 'X86Soundness.agda', u(AP) + 'X86LogRel.agda', u(AP) + 'X86.agda',
+      u(AP) + 'Values.agda']),
+    ('uadeq', 'well-formedness of compiled programs',
+     [u(AP) + 'Clos5WF.agda', u(AP) + 'CompileWF.agda', u(AP) + 'X86CompileWF.agda', u(AP) + 'X86WF.agda']),
+    ('uadeq', 'end to end', [u(AP) + 'EndToEnd.agda', u(AP) + 'ISWIMCompile.agda']),
+    ('ugadeq', 'Clos5', [u(GEA) + 'Clos5Common.agda', u(GEA) + 'Clos5Soundness.agda', u(GEA) + 'Clos5LogRel.agda',
+                         u(GEA) + 'Clos5.agda']),
+    ('ugadeq', 'X86',
+     [u(GEA) + 'X86Common.agda', u(GEA) + 'X86Consistent.agda', u(GEA) + 'X86Soundness.agda',
+      u(GEA) + 'X86LogRel.agda', u(GEA) + 'X86.agda']),
+    ('ugadeq', 'well-formedness of compiled programs',
+     [u(GEA) + 'Clos5WF.agda', u(GEA) + 'X86CompileWF.agda', u(GEA) + 'X86WF.agda']),
+    ('ugadeq', 'end to end', [u(GEA) + 'EndToEnd.agda']),
+    ('uexamples', 'examples', [u(GC) + '*Example.agda', u(PC) + 'Examples/*.agda']),
+    # not in the totals: a direct backward simulation for split, without
+    # determinism, and the direct semantics of Imp (ImpDirect.agda) with lift
+    # locals and explicate control proved against it (see loc.md)
+    ('uexp', 'simulation: direct backward simulation for split — framework', [u(OP) + 'Backward.agda']),
+    ('uexp', 'simulation: direct backward simulation for split — split', [u(OC) + 'SplitBackSim.agda']),
+    ('uexp', 'graph model: direct Imp — semantics', [u(GP) + 'ImpDirect.agda']),
+    ('uexp', 'graph model: direct Imp — lift locals', [u(GC) + 'LiftLocalsCorrect.agda']),
+    ('uexp', 'graph model: direct Imp — explicate control', [u(GC) + 'ExplicateCorrect.agda']),
+    ('uthm', 'theorem statements', [U + 'Theorems/*.agda']),
+
+    # --- FPC (agda/FPC/), in no total of the ISWIM pipelines ------------------
+    # with the lemma that hoist refers only to older definitions, which
+    # only adequacy uses (shared in the typed pipeline, where the graph model
+    # with errors uses it too), counted as a shared module
+    ('mu-shared', 'syntax, languages, compiler passes',
+     [MU + 'Language/*.agda', MU + 'Compiler/*.agda', MUP + 'Compiler/HoistOlder.agda']),
+    ('mu-infra', 'heterogeneous vectors: lookup, collecting, selecting, relating',
+     [MU + 'Framework/*.agda', MUP + 'Framework/AllProp.agda']),
+    # the properties of the typed frames (reads after writes, agreement,
+    # restriction), which the machine and interpreter proofs of lift locals,
+    # explicate control and select instructions use; the denotational
+    # columns prove their agreement lemmas in their own proofs
+    ('mu-op+mu-ck+mu-red', 'lemmas shared by the passes', [MUP + 'Framework/SlotsProp.agda']),
+    # the values of the typed frames, which the machines and interpreters of
+    # Impμ, CFGμ and X86μ hold
+    ('mu-op+mu-ck+mu-red', 'semantics of the languages', [MU + 'Semantics/Slots.agda']),
+    # simplify's syntactic lemmas are used by its four proofs: counted in the
+    # simplify row of each column, as in the main table
+    ('mu-den+mu-op+mu-ck+mu-red', 'simplify', [MUP + 'Compiler/SimplifyFacts.agda']),
+    ('mu-den', 'semantics of the languages', [MU + 'Semantics/GraphModel/*.agda', MUP + 'Semantics/GraphModel/*.agda']),
+    ('mu-den', 'simplify', [MUP + 'Correctness/GraphModel/SimplifyCorrect.agda']),
+    ('mu-den', 'CC: capture', [MUP + 'Correctness/GraphModel/CaptureCorrect.agda']),
+    ('mu-den', 'CC: prune', [MUP + 'Correctness/GraphModel/PruneCorrect.agda']),
+    ('mu-den', 'CC: concretize', [MUP + 'Correctness/GraphModel/ConcretizeCorrect.agda']),
+    ('mu-den', 'CC: split', [MUP + 'Correctness/GraphModel/ApproxLR.agda']
+     + [MUP + 'Correctness/GraphModel/Split' + x + '.agda' for x in ('Rel', 'Preserve', 'Reflect', 'Correct')]),
+    ('mu-den', 'CC: hoist', [MUP + 'Correctness/GraphModel/HoistCorrect.agda']),
+    ('mu-den', 'rco', [MUP + 'Correctness/GraphModel/RCOCorrect.agda']),
+    ('mu-den', 'lift locals', [MUP + 'Correctness/GraphModel/LiftLocalsCorrect.agda']),
+    ('mu-den', 'explicate control', [MUP + 'Correctness/GraphModel/ExplicateCorrect.agda']),
+    ('mu-den', 'select instructions', [MUP + 'Correctness/GraphModel/SelectCorrect.agda']),
+    ('mu-den', 'composition', [MUP + 'Correctness/GraphModel/CompilerCorrect.agda']),
+    # the machines of FPC and Closμ–PairClosμ; those of GlobalFunμ, Impμ, CFGμ
+    # and X86μ, with the proofs of explicate control and select
+    # instructions, are shared with the reduction column ('mu-op+mu-red'),
+    # as the typed pipeline's are ('op+red')
+    ('mu-op', 'semantics of the languages', [MU + 'Semantics/AbstractMachines/' + x + '.agda' for x in ('Values', 'FPC', 'Clos', 'EnvClos', 'PairClos')]),
+    ('mu-op+mu-red', 'semantics of the languages', [MU + 'Semantics/AbstractMachines/' + x + '.agda' for x in ('GlobalFun', 'Imp', 'CFG', 'X86')]),
+    ('mu-op', 'simplify', [MUP + 'Correctness/AbstractMachines/SimplifySim.agda']),
+    ('mu-op', 'CC: capture', [MUP + 'Correctness/AbstractMachines/CaptureSim.agda']),
+    ('mu-op', 'CC: prune', [MUP + 'Correctness/AbstractMachines/PruneSim.agda']),
+    ('mu-op', 'CC: concretize', [MUP + 'Correctness/AbstractMachines/ConcretizeSim.agda']),
+    ('mu-op', 'CC: split', [MUP + 'Correctness/AbstractMachines/SplitSim.agda']),
+    ('mu-op', 'lemmas shared by the passes', [MUP + 'Correctness/AbstractMachines/GlobalFunCommon.agda', MUP + 'Semantics/AbstractMachines/Rel.agda']),
+    ('mu-op', 'CC: hoist', [MUP + 'Correctness/AbstractMachines/HoistSim.agda']),
+    ('mu-op', 'rco', [MUP + 'Correctness/AbstractMachines/RCOSim.agda']),
+    ('mu-op', 'lift locals', [MUP + 'Correctness/AbstractMachines/LiftLocalsSim.agda']),
+    ('mu-op+mu-red', 'explicate control', [MUP + 'Correctness/AbstractMachines/ExplicateSim.agda']),
+    ('mu-op+mu-red', 'select instructions', [MUP + 'Correctness/AbstractMachines/SelectSim.agda']),
+    ('mu-op', 'composition', [MUP + 'Correctness/AbstractMachines/PipelineSim.agda']),
+    ('mu-ck', 'semantics of the languages', [MU + 'Semantics/ClockedInterpreters/*.agda', MUP + 'Semantics/ClockedInterpreters/*.agda']),
+    ('mu-ck', 'simplify', [MUP + 'Correctness/ClockedInterpreters/SimplifyFuel.agda']),
+    ('mu-ck', 'CC: capture', [MUP + 'Correctness/ClockedInterpreters/CaptureFuel.agda']),
+    ('mu-ck', 'CC: prune', [MUP + 'Correctness/ClockedInterpreters/PruneFuel.agda']),
+    ('mu-ck', 'CC: concretize', [MUP + 'Correctness/ClockedInterpreters/ConcretizeFuel.agda']),
+    ('mu-ck', 'CC: split', [MUP + 'Correctness/ClockedInterpreters/SplitFuel.agda']),
+    ('mu-ck', 'CC: hoist', [MUP + 'Correctness/ClockedInterpreters/HoistFuel.agda']),
+    ('mu-ck', 'rco', [MUP + 'Correctness/ClockedInterpreters/RCOFuel.agda']),
+    ('mu-ck', 'lift locals', [MUP + 'Correctness/ClockedInterpreters/LiftLocalsFuel.agda']),
+    ('mu-ck', 'explicate control', [MUP + 'Correctness/ClockedInterpreters/ExplicateFuel.agda']),
+    ('mu-ck', 'select instructions', [MUP + 'Correctness/ClockedInterpreters/SelectFuel.agda']),
+    ('mu-ck', 'composition', [MUP + 'Correctness/ClockedInterpreters/CompilerFuel.agda']),
+    # P2: that no semantics of FPC or X86μ stops with an error (only
+    # the alternative adequacy for the CEK machines needs the machines';
+    # the others are stated for completeness), in no column
+    ('mu-noerr', 'CEK machines of FPC and X86μ (X86μ\'s is also the reduction column\'s)',
+     [MUP + 'Semantics/AbstractMachines/NoError.agda']),
+    ('mu-noerr', 'clocked interpreters of FPC and X86μ', [MUP + 'Semantics/ClockedInterpreters/NoError.agda']),
+    ('mu-noerr', 'reduction semantics of FPC', [MUP + 'Semantics/ReductionSemantics/NoError.agda']),
+    # P2: adequacy of the graph model, for the clocked interpreters of
+    # FPC and X86μ (direct), with the interpreter column's end theorem;
+    # no GlobalFunμ adequacy, which the end-to-end theorem into X86μ does not
+    # need.  The ISWIM row is also the bridge of the mixed proof.  The
+    # alternative for the CEK machines ('mu-adeq-cek', in no total) shares
+    # the tuples of sets, the tables' lemmas and the well-formedness of
+    # compiled programs ('mu-adeq+mu-adeq-cek', counted in both)
+    ('mu-adeq+mu-adeq-cek+mu-adeq-red', 'ISWIM', [MUP + 'Adequacy/Tuples.agda']),
+    ('mu-adeq', 'ISWIM', [MUP + 'Adequacy/' + x + '.agda' for x in ('Soundness', 'LogRel', 'FPC')]),
+    # the values of the GlobalFunμ interpreter in the graph model and the
+    # tables' lemmas, which X86μ adequacy uses (as X86ᵀ's uses Clos5ᵀ's)
+    ('mu-adeq+mu-adeq-cek+mu-adeq-red', 'Clos5', [MUP + 'Adequacy/GlobalFunCommon.agda']),
+    ('mu-adeq', 'Clos5', [MUP + 'Adequacy/GlobalFunValues.agda']),
+    ('mu-adeq', 'X86', [MUP + 'Adequacy/X86' + x + '.agda' for x in ('Common', 'Slots', 'LogRel', 'Soundness', '')]),
+    ('mu-adeq+mu-adeq-cek+mu-adeq-red', 'well-formedness of compiled programs', [MUP + 'Adequacy/X86Compiled.agda']),
+    ('mu-adeq', 'end to end', [MUP + 'Adequacy/EndToEnd.agda']),
+    # the alternative: adequacy for the CEK machines of FPC and X86μ
+    ('mu-adeq-cek', 'ISWIM', [MUP + 'Adequacy/AbstractMachines/' + x + '.agda' for x in ('Soundness', 'LogRel', 'FPC')]),
+    ('mu-adeq-cek+mu-adeq-red', 'Clos5', [MUP + 'Adequacy/AbstractMachines/GlobalFunValues.agda']),
+    ('mu-adeq-cek+mu-adeq-red', 'X86', [MUP + 'Adequacy/AbstractMachines/X86' + x + '.agda' for x in ('Common', 'LogRel', 'Soundness', '')]),
+    ('mu-adeq-cek', 'end to end', [MUP + 'Adequacy/AbstractMachines/EndToEnd.agda']),
+    # the alternative for the reduction semantics of FPC ('mu-adeq-red', in
+    # no total): its target is the X86μ machine, as in the reduction
+    # column's end theorem, so it shares the CEK alternative's X86μ rows
+    # (counted in both); X86μ's adequacy for the machine imports two
+    # three-line lemmas about machines from the CEK alternative's FPC row,
+    # which are not counted here
+    ('mu-adeq-red', 'ISWIM', [MUP + 'Adequacy/ReductionSemantics/' + x + '.agda' for x in ('Soundness', 'LogRel', 'FPC')]),
+    ('mu-adeq-red', 'end to end', [MUP + 'Adequacy/ReductionSemantics/EndToEnd.agda']),
+    ('mu-examples', 'examples', [MU + 'Examples.agda', MUP + 'Compiler/Examples/*.agda']),
+    # design experiments, in no total: the split relation on target sets of
+    # bounded depth (the paper's design space for reflection, §4.2)
+    ('mu-exp', 'split: design experiments (target sets of bounded depth; a finite source side)',
+     [MUP + 'Correctness/GraphModel/SplitDesign*.agda']),
+    # mixing semantics (--mixed): simplify in the graph model and the other
+    # passes by the interpreters, joined by the bridge at FPC (its graph
+    # semantics against its interpreter: the ISWIM row of adequacy); it
+    # reuses the per-pass proofs of both columns, in no total of the four
+    ('mu-mix', 'composition', [MUP + 'Mixed/CompilerMixed.agda']),
+    # FPC's reduction column: reduction
+    # semantics of the languages with binders, the simulations, and the
+    # reduction framework for heterogeneous vectors (infrastructure); it
+    # shares the CEK column's machines of the first-order languages and its
+    # proofs of explicate control and select instructions (MU_RED_SHARED), as
+    # the typed pipeline's reduction column does ('op+red')
+    ('mu-red', 'semantics of the languages', [MU + 'Semantics/ReductionSemantics/*.agda', MUP + 'Semantics/ReductionSemantics/*.agda']),
+    ('mu-red', 'simplify', [MUP + 'Correctness/ReductionSemantics/SimplifyRed.agda']),
+    ('mu-red', 'CC: capture', [MUP + 'Correctness/ReductionSemantics/CaptureRed.agda']),
+    ('mu-red', 'CC: prune', [MUP + 'Correctness/ReductionSemantics/PruneRed.agda']),
+    ('mu-red', 'CC: concretize', [MUP + 'Correctness/ReductionSemantics/ConcretizeRed.agda']),
+    ('mu-red', 'CC: split', [MUP + 'Correctness/ReductionSemantics/SplitRed.agda']),
+    ('mu-red', 'CC: hoist', [MUP + 'Correctness/ReductionSemantics/HoistRed.agda']),
+    ('mu-red', 'rco', [MUP + 'Correctness/ReductionSemantics/RCORed.agda']),
+    ('mu-red', 'lift locals', [MUP + 'Correctness/ReductionSemantics/LiftLocalsRed.agda']),
+    ('mu-red', 'composition', [MUP + 'Correctness/ReductionSemantics/PipelineRed.agda']),
+    ('mu-rinfra', 'reduction of heterogeneous vectors',
+     [MU + 'Framework/ReductionAll.agda', MUP + 'Framework/ReductionAll.agda']),
+    # not in the totals: FPC's public theorem statements (see its
+    # audit-surface table)
+    ('mu-thm', 'theorem statements', [MU + 'Theorems/*.agda']),
+]
+
+ADEQ_ROWS = ['ISWIM', 'Clos5', 'X86', 'X86ᵀ', 'well-formedness of compiled programs', 'end to end',
+             'simplify through the ISWIM machine']
+ROWS = ['semantics of the languages', 'lemmas shared by the passes', 'simplify', 'cast insertion',
+        'CC: capture', 'CC: prune', 'CC: concretize', 'CC: split', 'CC: hoist', 'rco',
+        'lift locals', 'explicate control', 'select instructions', 'composition']
+
+# the style of each side, for the independence checks and the labels
+STYLE = {}
+for _p in (TYPED, UNTYPED):
+    for _s, _t in zip(_p['sides'] + (_p['gerr'], _p['adeq'], _p['gadeq']),
+                      ('den', 'op', 'ck', 'red', 'gerr', 'adeq', 'gadeq')):
+        STYLE[_s] = _t
+LABELS = {'den': 'denotational: graph model', 'op': 'CEK machine + simulation',
+          'ck': 'clocked interpreter + value relations',
+          'red': 'reduction semantics + simulation', 'adeq': 'adequacy',
+          'gerr': 'graph model with errors', 'gadeq': 'adequacy with errors'}
+NAMES = {'den': 'graph model', 'op': 'simulation', 'ck': 'interpreter',
+         'red': 'reduction', 'adeq': 'adequacy', 'gerr': 'graph model with errors',
+         'gadeq': 'adequacy with errors'}
+EXTRA = 'shared modules not used by all four proofs'
+
+
+def tag(P):
+    """The marker of the untyped pipeline's and FPC's tables, so that their
+    header lines differ from the typed ISWIM pipeline's."""
+    return '' if P is TYPED else ' (untyped pipeline)' if P is UNTYPED else ' (FPC)'
+
+
+def label(s):
+    return LABELS[STYLE[s]]
+
+
+def name(s):
+    return NAMES[STYLE[s]]
+
+
+def any_style(s):
+    """The style of a side of any pipeline, FPC's ('mu-den', ...) too."""
+    return s[len('mu-'):] if s.startswith('mu-') else STYLE[s]
+
+
+def any_label(s):
+    return LABELS[any_style(s)]
+
+
+def any_name(s):
+    return NAMES[any_style(s)]
+
+
+def strip_comments(s):
+    """The text of s without {- -} blocks and -- line comments (newlines kept)."""
+    out, i, depth = [], 0, 0
+    while i < len(s):
+        if s.startswith('{-', i):
+            depth += 1; i += 2; continue
+        if depth and s.startswith('-}', i):
+            depth -= 1; i += 2; continue
+        if depth:
+            if s[i] == '\n':
+                out.append('\n')
+            i += 1; continue
+        out.append(s[i]); i += 1
+    return '\n'.join(re.sub(r'(^|\s)--.*$', '', line)
+                     for line in ''.join(out).split('\n'))
+
+
+IMPORT_START = re.compile(r'(\s*)(?:open\s+)?import\b')
+
+_CODE = {}
+
+
+# What code_lines measures: 'tokens' (lexical tokens, the default),
+# 'lines' (--lines) or 'chars' (--chars), on the same code lines in every
+# case (see the definition of a lexical token above).
+MEASURE = 'tokens'
+# the name of the measure in the tables and the prose
+UNIT = 'lexical tokens'
+UNITS = {'tokens': 'lexical tokens', 'lines': 'lines', 'chars': 'non-whitespace characters'}
+
+# Agda's lexer, approximately: a parenthesis, a brace, `;`, `@` or a `.`
+# that starts a word (a dot pattern or an irrelevant binder) is a token by
+# itself, and so is every other run of non-whitespace characters, so that a
+# name such as `ΛΛ-⋆`, `⟦_⟧₃`, `ρ'`, a qualified name such as `S.Env`, or
+# an operator such as `→` or `＝` is one token.
+TOKEN = re.compile(r'\{\{|\}\}|[(){};@]|\.(?=[^\s.(){};@])|[^\s(){};@]+')
+
+
+def measure(line, how):
+    if how == 'tokens':
+        return len(TOKEN.findall(line))
+    if how == 'chars':
+        return len(''.join(line.split()))
+    return 1
+
+
+def code_lines(path, how=None):
+    """The size of path's code, not counting import statements: a line that
+    starts with `import` or `open import`, and the lines after it that are
+    indented more deeply (its continuation).  The size is in lines, tokens
+    or characters (MEASURE, unless how is given)."""
+    how = how or MEASURE
+    if (path, how) in _CODE:
+        return _CODE[(path, how)]
+    text = strip_comments(open(path, encoding='utf-8').read())
+    n, indent = 0, None
+    for line in text.split('\n'):
+        if not line.strip():
+            continue
+        col = len(line) - len(line.lstrip())
+        if indent is not None and col > indent:
+            continue
+        m = IMPORT_START.match(line)
+        indent = len(m.group(1)) if m else None
+        if not m:
+            n += measure(line, how)
+    _CODE[(path, how)] = n
+    return n
+
+
+# `import M`, `open import M`, `import M as X`, `open import M args using (…)`,
+# `… public`, with the module name possibly on the next line.
+IMPORT = re.compile(r'(?<![^\s;{(])(?:open\s+)?import\s+([^\s;(){}]+)')
+
+
+def imports(path):
+    """Files under agda/ that path imports (library modules are ignored),
+    with each import bundle replaced by the files it re-exports."""
+    text = strip_comments(open(path, encoding='utf-8').read())
+    out = set()
+    for m in IMPORT.finditer(text):
+        f = 'agda/' + m.group(1).replace('.', '/') + '.agda'
+        if f in BUNDLES:
+            out |= imports(f)
+        elif os.path.exists(f):
+            out.add(f)
+    return out
+
+
+def is_proof(f):
+    return (f.startswith(A + 'proof/') or f.startswith(I + 'proof/') or f.startswith(U + 'proof/')
+            or f.startswith(MUP))
+
+
+def unit(f):
+    """The unit of a file: agda/X.agda for both agda/X.agda and its proof half
+    agda/proof/X.agda (likewise under agda/ISWIM/, agda/ISWIM/Untyped/ and
+    agda/FPC/)."""
+    if f.startswith(MUP):
+        return MU + f[len(MUP):]
+    if f.startswith(U + 'proof/'):
+        return U + f[len(U + 'proof/'):]
+    if f.startswith(I + 'proof/'):
+        return I + f[len(I + 'proof/'):]
+    if f.startswith(A + 'proof/'):
+        return A + f[len(A + 'proof/'):]
+    return f
+
+
+def reachable(roots, graph, avoid=frozenset()):
+    """The units reachable from roots, not entering those in avoid."""
+    seen, todo = set(), [r for r in roots if r not in avoid]
+    while todo:
+        f = todo.pop()
+        if f not in seen:
+            seen.add(f)
+            todo.extend(g for g in graph[f] if g not in avoid)
+    return seen
+
+
+def modname(f):
+    return f[len("agda/"):-len(".agda")].replace("/", ".")
+
+
+def sides_of(side):
+    """The proofs a group belongs to: 'op+red' is counted in both."""
+    return side.split('+')
+
+
+def bold_min(ns):
+    """Cells for the numbers ns (None for a missing entry), with the lowest
+    in bold when at least two entries are present: the best result."""
+    present = [n for n in ns if n is not None]
+    low = min(present) if len(present) >= 2 else None
+    return [('—' if n is None else f'**{n}**' if n == low else str(n)) for n in ns]
+
+
+class Count:
+    """The groups, units, import graph and checks; then each pipeline's
+    counts (analyze)."""
+
+    def __init__(self):
+        seen, counts, files_of = {}, {}, {}
+        # a file named explicitly by a group is not matched by another's wildcard
+        explicit = {p for _, _, pats in GROUPS for p in pats if '*' not in p}
+        for b in sorted(BUNDLES):
+            if ARTIFACT and not os.path.exists(b):
+                continue
+            # a bundle has only its module header and imports
+            if code_lines(b, 'lines') != 1:
+                sys.exit(f'{b}, an import bundle, has lines other than imports')
+        for side, gname, pats in GROUPS:
+            files = sorted({f for p in pats for f in glob.glob(p)
+                            if ('*' not in p or f not in explicit) and f not in BUNDLES and f not in SCOTT_FILES})
+            if not files:
+                if ARTIFACT:
+                    # a group of a pipeline that the artifact leaves out
+                    files_of.setdefault((side, gname), [])
+                    continue
+                sys.exit(f'no files for group {side}/{gname}')
+            for f in files:
+                if f in seen:
+                    sys.exit(f'{f} is in two groups: {seen[f]} and {(side, gname)}')
+                seen[f] = (side, gname)
+            files_of[(side, gname)] = files_of.get((side, gname), []) + files
+            for s in sides_of(side):
+                counts[(s, gname)] = counts.get((s, gname), 0) + sum(code_lines(f) for f in files)
+        every = {f for f in glob.glob('agda/**/*.agda', recursive=True)
+                 if not f.startswith('agda/old/') and f not in ('agda/All.agda', I + 'All.agda', U + 'All.agda', MU + 'All.agda', MU + 'Experiments.agda')
+                 and f not in BUNDLES and f not in scott_files() and not f.startswith('agda/Scratch/')}
+        missing = sorted(every - set(seen))
+        if missing:
+            sys.exit('not in any group:\n  ' + '\n  '.join(missing))
+
+        # units: the two halves of a split module count as one module
+        files_of_unit = {}
+        for f in every:
+            files_of_unit.setdefault(unit(f), []).append(f)
+        group_of = {}
+        for un, fs in files_of_unit.items():
+            gs = {seen[f] for f in fs}
+            if len(gs) > 1:
+                sys.exit(f'the halves of {un} are in different groups: {sorted(gs)}')
+            group_of[un] = gs.pop()
+        self.seen, self.counts, self.files_of = seen, counts, files_of
+        self.every, self.files_of_unit, self.group_of = every, files_of_unit, group_of
+        self.units = set(files_of_unit)
+        self.fgraph = {f: imports(f) for f in every}
+        self.graph = {un: {unit(g) for f in files_of_unit[un] for g in self.fgraph[f]} - {un}
+                      for un in self.units}
+        allsides = set(STYLE)
+        self.own = {s: {un for un, (side, _) in group_of.items() if s in sides_of(side)} for s in allsides}
+        self.infra = {un for un, (side, _) in group_of.items() if side == 'infra'}
+        self.reach = {s: reachable(self.own[s], self.graph) for s in allsides}
+        # the import closure of each proof, file by file: the infrastructure
+        # it is charged for is the files of it that it imports, so a proof
+        # that imports only the definitions half of a split module is not
+        # charged for its proof/ half, nor for what that half imports
+        self.freach = {s: self.closure(f for un in self.own[s] for f in files_of_unit[un])
+                       for s in allsides}
+        self.check()
+
+    def closure(self, files):
+        """The files reachable from files through imports (files included)."""
+        return reachable(set(files), {f: self.fgraph[f] & self.every for f in self.every})
+
+    def ilines(self, us, files):
+        """The lines of the files of units us that are in the set files."""
+        return sum(code_lines(f) for un in us for f in self.files_of_unit[un] if f in files)
+
+    def uses(self, un, files):
+        """Some file of unit un is in the set files."""
+        return any(f in files for f in self.files_of_unit[un])
+
+    def ulines(self, un):
+        return sum(code_lines(f) for f in self.files_of_unit[un])
+
+    def lines(self, us):
+        return sum(self.ulines(un) for un in us)
+
+    def display(self, un):
+        """The name of a unit, and (+ proof/) when it is split."""
+        fs = sorted(self.files_of_unit[un], key=is_proof)
+        mark = ' (+ proof/)' if len(fs) > 1 else ''
+        return f'`{modname(fs[0])}`{mark}'
+
+    def check(self):
+        group_of, graph, own, reach = self.group_of, self.graph, self.own, self.reach
+        # Infrastructure is language independent: it imports only infrastructure.
+        bad = sorted(reachable(self.infra, graph) - self.infra)
+        if bad:
+            sys.exit('infrastructure imports modules that are not infrastructure:\n  ' + '\n  '.join(bad))
+        # The main development does not depend on the untyped one.
+        for f in sorted(self.every):
+            if not f.startswith(U):
+                bad = sorted(g for g in self.fgraph[f] if g.startswith(U))
+                if bad:
+                    sys.exit(f'{f} imports modules of agda/ISWIM/Untyped/:\n  ' + '\n  '.join(bad))
+        # The proofs must be independent: no proof reaches another proof's
+        # modules (of either pipeline, the shared rows apart), nor adequacy's,
+        # an example or an experiment (adequacy, examples and experiments may
+        # use anything).  The graph models with errors may use the graph
+        # model's meaning of the primitives, which they extend.
+        exp = {un for un, (side, _) in group_of.items() if side in ('uexp', 'examples', 'uexamples')}
+        cols = [s for s in STYLE if STYLE[s] in ('den', 'op', 'ck', 'red', 'gerr')]
+        prim = {SG + 'Prim.agda'}
+        for s in cols:
+            for t in STYLE:
+                if t == s:
+                    continue
+                bad = reach[s] & (own[t] - own[s])
+                if STYLE[s] == 'gerr':
+                    bad -= prim
+                if bad:
+                    sys.exit(f'{s} ({name(s)}) imports {t} ({name(t)}) modules:\n  ' + '\n  '.join(sorted(bad)))
+            bad = sorted(reach[s] & exp)
+            if bad:
+                sys.exit(f'{s} ({name(s)}) imports example or experiment modules:\n  ' + '\n  '.join(bad))
+        # The audit surface: every module outside the proof/ directories,
+        # reached from the theorem files through modules outside them, and
+        # importing none of them (but the theorem files, which cite the
+        # proofs).
+        thm = set(TYPED['thm'].values()) | set(UNTYPED['thm'].values()) | {ASSURE_THM}
+        if ARTIFACT:
+            # no theorem files of the other pipelines: the modules of agda/
+            # outside proof/ must be reached from FPC's
+            thm = set()
+        elif thm != {f for f, (side, _) in self.seen.items() if side in ('thm', 'uthm')}:
+            sys.exit('the theorem files are not ' + ', '.join(sorted(thm)))
+        # FPC's audit surface is that of agda/FPC/, reached from its own
+        # theorem files (agda/FPC/Theorems/), with the modules of agda/ they
+        # reach (the frameworks, the observations, ...)
+        mthm = set(MU_P['thm'].values())
+        if mthm != {f for f, (side, _) in self.seen.items() if side == 'mu-thm'}:
+            sys.exit('the theorem files of FPC are not ' + ', '.join(sorted(mthm)))
+        surface = {f for f in self.every if not is_proof(f) and not f.startswith(MU)}
+        msurface = {f for f in self.every if not is_proof(f) and f.startswith(MU)}
+        self.sgraph = {f: {g for g in self.fgraph[f] if g in surface | msurface} for f in surface | msurface}
+        for f in sorted((surface | msurface) - thm - mthm):
+            bad = sorted(g for g in self.fgraph[f] if is_proof(g))
+            if bad:
+                sys.exit(f'{f}, on the audit surface, imports proof modules:\n  ' + '\n  '.join(bad))
+        unreached = sorted(surface - reachable(thm | (mthm if ARTIFACT else set()), self.sgraph))
+        if ARTIFACT:
+            # in the artifact, the infrastructure that only FPC's proofs use
+            # (the syntax lemmas of the reduction column) is reached from no
+            # theorem file; outside the artifact the ISWIM pipeline's reach it
+            unreached = [f for f in unreached if self.seen[f][0] != 'infra']
+        if unreached:
+            sys.exit('outside the proof/ directories but not reached from the theorem files:\n  '
+                     + '\n  '.join(unreached))
+        # FPC's theorem files state only the end-to-end theorems (and
+        # split's), so the semantics of the intermediate languages, which
+        # only the proofs use, are definitions outside FPC/proof/ that no
+        # statement reaches; they must be semantics, and import no proof
+        # module (checked above)
+        # FPC/Examples.agda runs example programs on FPC's interpreter: it
+        # is on the audit surface (it imports no proof module), but no
+        # statement reaches it
+        self.munreached = sorted(msurface - reachable(mthm, self.sgraph) - {MU + 'Examples.agda'})
+        bad = [f for f in self.munreached if not f.startswith(MU + 'Semantics/')]
+        if bad:
+            sys.exit('in agda/FPC/, outside FPC/proof/ and FPC/Semantics/, but not reached from the theorem '
+                     'files of FPC:\n  ' + '\n  '.join(bad))
+        self.thm, self.mthm = thm, mthm
+
+    def analyze(self, P):
+        """The totals of pipeline P: per column and row, the shared modules each
+        counts, adequacy's."""
+        own, reach, graph, group_of = self.own, self.reach, self.graph, self.group_of
+        sides, gerr, adeq, gadeq = P['sides'], P['gerr'], P['adeq'], P['gadeq']
+        shared = {un for un, (side, _) in group_of.items() if side in P['shared']}
+        by_all = shared.intersection(*(reach[s] for s in sides))
+        extra = {s: sorted((shared & reach[s]) - by_all) for s in sides}
+        # Adequacy is an add-on to the denotational proof, so shared modules that
+        # the denotational proof already counts are not counted again.
+        extra[adeq] = sorted((shared & reach[adeq]) - by_all - set(extra[sides[0]]))
+        # The graph model with errors is counted as the four are: its own
+        # modules and the shared ones it reaches that all four do not; and the
+        # graph model's modules it uses (the meaning of the primitives).  Its
+        # adequacy is counted as adequacy is: what it adds to its proof.  Where
+        # it derives Clos5ᵀ adequacy from the CEK column's simulation, the CEK
+        # modules it reaches (and what only they reach) are reported apart.
+        den = sides[0]
+        extra[gerr] = sorted((shared & reach[gerr]) - by_all)
+        borrowed = {gerr: sorted(reach[gerr] & (own[den] - own[gerr]))}
+        others = {un for un, (side, row) in group_of.items()
+                  if set(sides_of(side)) & set(sides[1:]) and row != 'semantics of the languages'} \
+            - own[gerr] - own[gadeq]
+        rg = reachable(own[gadeq], graph, avoid=others)
+        derived = sorted(reachable(own[gadeq], graph) - rg - self.infra - reach[gerr])
+        extra[gadeq] = sorted((shared & rg) - by_all - set(extra[gerr]))
+        borrowed[gadeq] = sorted(rg & ((own[den] | own[adeq]) - own[gerr]) - reach[gerr])
+        mcols = sides + (gerr,)
+        total = {s: 0 for s in mcols}
+        cells = {}
+        for r in ROWS:
+            for s in mcols:
+                n = self.counts.get((s, r))
+                total[s] += n or 0
+                cells[(s, r)] = n
+        for s in mcols:
+            n = self.lines(extra[s])
+            total[s] += n
+            cells[(s, EXTRA)] = n if extra[s] else None
+        n = self.lines(borrowed[gerr])
+        total[gerr] += n
+        cells[(gerr, 'prim')] = n
+        anames = [r for r in ADEQ_ROWS if any(self.counts.get((s, r)) for s in (adeq, gadeq))]
+        adq = {adeq: 0, gadeq: 0}
+        for gname in anames:
+            for s in (adeq, gadeq):
+                adq[s] += self.counts.get((s, gname)) or 0
+        for s in (adeq, gadeq):
+            adq[s] += self.lines(extra[s])
+        adq[gadeq] += self.lines(borrowed[gadeq])
+        return dict(P=P, mcols=mcols, total=total, cells=cells, extra=extra, borrowed=borrowed,
+                    by_all=by_all, shared=shared, anames=anames, adq=adq, derived=derived)
+
+    def print_pipeline(self, R):
+        P, mcols, cells, total = R['P'], R['mcols'], R['cells'], R['total']
+        sides, gerr, adeq, gadeq = P['sides'], P['gerr'], P['adeq'], P['gadeq']
+        extra, borrowed = R['extra'], R['borrowed']
+        print(f'| component{tag(P)} | ' + ' | '.join(label(s) for s in mcols) + ' |')
+        print('|---|' + '---:|' * len(mcols))
+        for r in ROWS:
+            ns = [cells[(s, r)] for s in mcols]
+            if any(n is not None for n in ns):
+                print(f'| {r} | ' + ' | '.join(bold_min(ns)) + ' |')
+        print(f'| {EXTRA} | ' + ' | '.join(bold_min([cells[(s, EXTRA)] for s in mcols])) + ' |')
+        print("| the graph model's meaning of the primitives | — | — | — | — | " + str(cells[(gerr, 'prim')]) + ' |')
+        print('| **total** | ' + ' | '.join(bold_min([total[s] for s in mcols])) + ' |')
+        print()
+
+        reach, infra, fr = self.reach, self.infra, self.freach
+        print(f'| language-independent infrastructure{tag(P)} (not in the totals) | {UNIT} | '
+              + ' | '.join(f'used by {label(s)}' for s in mcols) + ' |')
+        print('|---|---:|' + '---:|' * len(mcols))
+        itotal = {s: 0 for s in mcols}
+        for side, gname, _ in GROUPS:
+            if side == 'infra':
+                us = {unit(f) for f in self.files_of[(side, gname)]}
+                row = []
+                for s in mcols:
+                    n = self.ilines(us, fr[s])
+                    itotal[s] += n
+                    row.append(str(n) if n else '—')
+                print(f'| {gname} | {self.counts[(side, gname)]} | ' + ' | '.join(row) + ' |')
+        print(f'| **total** | {self.lines(infra)} | ' + ' | '.join(str(itotal[s]) for s in mcols) + ' |')
+        print()
+        print(f"Adequacy uses {self.ilines(infra, fr[adeq])} {UNIT} of the infrastructure, "
+              f"{self.ilines(infra, fr[adeq] - fr[sides[0]])} of them not used by the denotational proof.")
+        print()
+        print(f'| adequacy{tag(P)} (denotational side only) | graph model | graph model with errors |')
+        print('|---|---:|---:|')
+        for gname in R['anames']:
+            print(f'| {gname} | ' + ' | '.join(bold_min([self.counts.get((s, gname)) for s in (adeq, gadeq)])) + ' |')
+        ns = [self.lines(extra[s]) if extra[s] else None for s in (adeq, gadeq)]
+        print(f'| {EXTRA}, nor by the proof of its model | ' + ' | '.join(bold_min(ns)) + ' |')
+        n = self.lines(borrowed[gadeq])
+        print(f"| the graph model's modules it uses | — | {n if borrowed[gadeq] else '—'} |")
+        print('| **total** | ' + ' | '.join(bold_min([R['adq'][adeq], R['adq'][gadeq]])) + ' |')
+        if R['derived']:
+            print(f"| the CEK proof it derives Clos5ᵀ adequacy from (not in the total) | — | "
+                  f"{self.lines(R['derived'])} |")
+            print()
+            print('The CEK modules that adequacy with errors reaches only to derive Clos5ᵀ adequacy: '
+                  + ', '.join(f'{self.display(un)} ({self.ulines(un)})' for un in R['derived']) + '.')
+        print()
+        exps = [(side, gname) for side, gname, _ in GROUPS if side == P['exp']]
+        if exps:
+            print(f'| experiment{tag(P)} (not in the totals) | {UNIT} |')
+            print('|---|---:|')
+            for side, gname in exps:
+                print(f'| {gname} | {self.counts[(side, gname)]} |')
+            print()
+        self.print_audit(P)
+        self.print_modules(R)
+
+    def print_audit(self, P):
+        """The audit surface of each style: the modules outside the proof/
+        directories that its theorem file reaches, by kind."""
+        seen, sgraph = self.seen, self.sgraph
+        shared_infra = ('abstract binding trees', 'syntax lemmas (renaming, scoping, uses, substitution), list lookups',
+                        'base types, logical equivalence',
+                        'typed indices, lookup in typed lists, vectors (collecting, selecting, projecting)')
+
+        def kind(f):
+            side, gname = seen[f]
+            if side in ('thm', 'uthm', 'mu-thm'):
+                return 'statements'
+            if side in ('shared', 'ushared', 'mu-shared', 'mu-infra') or (side == 'infra' and gname in shared_infra):
+                return 'shared'
+            return 'semantics'
+        T = P['thm']
+        cols = P['sides'] + (P['adeq'],) + ((P['gerr'],) if P['gerr'] else ())
+        sreach = {s: reachable({T[s]}, sgraph) for s in cols}
+
+        def flines(fs):
+            return sum(code_lines(f) for f in fs)
+        sh = {s: {f for f in sreach[s] if kind(f) == 'shared'} for s in cols}
+        print(f'| audit surface{tag(P)} (not in the totals) | {UNIT} | '
+              + ' | '.join(f'read for {any_label(s)}' for s in cols) + ' |')
+        print('|---|---:|' + '---:|' * len(cols))
+        print(f'| languages, compiler passes, syntax, base types (shared) | {flines(set().union(*sh.values()))} | '
+              + ' | '.join(str(flines(sh[s])) for s in cols) + ' |')
+        SEMS = {'den': 'domain, operators, semantics of each language',
+                'op': 'small-step machines, transition systems',
+                'ck': 'clocked interpreters, results',
+                'red': 'reduction semantics, machines of the first-order languages, transition systems',
+                'gerr': 'domain, error-propagating operators, semantics of each language'}
+        sem_files = {s: {f for f in sreach[s] if kind(f) == 'semantics'} for s in cols}
+        for s in cols:
+            if s == P['adeq']:
+                continue
+            fs = sem_files[s]
+            print(f'| {any_name(s)}: {SEMS[any_style(s)]} | {flines(fs)} | '
+                  + ' | '.join(str(flines(sem_files[t] & fs)) if sem_files[t] & fs else '—' for t in cols) + ' |')
+        thm = set(T.values())
+        for s in cols:
+            print(f'| {any_name(s)}: theorem statements | {code_lines(T[s])} | '
+                  + ' | '.join(str(code_lines(T[s])) if t == s else '—' for t in cols) + ' |')
+        tot = {s: flines(sreach[s] - (thm - {T[s]})) for s in cols}
+        alls = set().union(*(sreach[s] for s in cols))
+        styles = [s for s in cols if s != P['adeq']]
+        low = min(tot[s] for s in styles)
+        print(f'| **total** | {flines(alls)} | '
+              + ' | '.join(f'**{tot[s]}**' if s != P['adeq'] and tot[s] == low else str(tot[s]) for s in cols) + ' |')
+        print()
+        rho = [f for f in sreach[P['adeq']] if f in thm and f != T[P['adeq']]]
+        if rho:
+            print('The adequacy statements also use ρ₀ from the denotational ones '
+                  f'({", ".join(f[len("agda/"):] for f in rho)}), not counted in its column.')
+            print()
+
+    def print_modules(self, R):
+        P, reach = R['P'], self.reach
+        users_of = P['sides'] + (P['adeq'], P['gerr'], P['gadeq'])
+        print(f'| shared module{tag(P)} | {UNIT} | used by |')
+        print('|---|---:|---|')
+        for un in sorted(R['shared'], key=lambda x: self.display(x)):
+            users = [name(s) for s in users_of if un in reach[s]]
+            if not users:
+                continue
+            who = 'all four proofs' if un in R['by_all'] else ', '.join(users)
+            print(f'| {self.display(un)} | {self.ulines(un)} | {who} |')
+        print()
+        print(f'| infrastructure module{tag(P)} | {UNIT} | used by |')
+        print('|---|---:|---|')
+        for un in sorted(self.infra, key=lambda x: self.display(x)):
+            users = [name(s) for s in users_of if self.uses(un, self.freach[s])]
+            print(f'| {self.display(un)} | {self.ulines(un)} | {", ".join(users) or "no proof"} |')
+        print()
+
+        def mods(us):
+            return ', '.join(f'{self.display(un)} ({self.ulines(un)})' for un in us) or 'none'
+        print(f"Shared by all four proofs, not counted: {len(R['by_all'])} modules, {self.lines(R['by_all'])} {UNIT}.")
+        for s in users_of:
+            print(f'Counted in {name(s)}: {mods(R["extra"][s])}.')
+        for s in (P['gerr'], P['gadeq']):
+            print(f'Of the graph model, counted in {name(s)}: {mods(R["borrowed"][s])}.')
+        unused = sorted(un for un in R['shared'] if not any(un in reach[s] for s in users_of)
+                        and self.group_of[un][0] in P['shared'][-1:])
+        if unused:
+            print(f'Shared but used by no proof: {mods(unused)}.')
+        ex = 'examples' if P is TYPED else 'uexamples'
+        print(f"Examples, not counted: {self.counts[(ex, 'examples')]} {UNIT}.")
+        print()
+        print("Module (+ proof/): the definitions are on the audit surface, the lemmas "
+              f"in its proof/ half; the {UNIT} are those of both.")
+        print()
+
+    def errors_infra(self, P):
+        """The infrastructure each graph model reaches, by group, and what they
+        share: the semantics and the correctness proofs (without adequacy), and
+        then what adequacy adds, in each model."""
+        reach = self.freach
+        den, gerr, adeq, gadeq = P['sides'][0], P['gerr'], P['adeq'], P['gadeq']
+        rd = reach[adeq] - reach[den]
+        ra = reach[gadeq] - reach[gerr]
+        print(f'| infrastructure group{tag(P)} | {UNIT} | graph model | graph model with errors | both '
+              '| adequacy adds: graph model | adequacy adds: graph model with errors |')
+        print('|---|---:|---:|---:|---:|---:|---:|')
+        tot = [0] * 6
+        for side, gname, _ in GROUPS:
+            if side == 'infra':
+                us = {unit(f) for f in self.files_of[(side, gname)]}
+                row = [self.lines(us),
+                       self.ilines(us, reach[den]),
+                       self.ilines(us, reach[gerr]),
+                       self.ilines(us, reach[den] & reach[gerr]),
+                       self.ilines(us, rd),
+                       self.ilines(us, ra)]
+                if any(row[1:]):
+                    tot = [t + r for t, r in zip(tot, row)]
+                    print(f'| {gname} | {row[0]} | ' + ' | '.join(str(r) if r else '—' for r in row[1:]) + ' |')
+        print('| **total** | ' + ' | '.join(str(t) for t in tot) + ' |')
+        ops = {unit(f) for f in self.files_of[('infra', 'graph model: its operators')]}
+        used = sorted(un for un in ops if self.uses(un, reach[gerr] | reach[gadeq]))
+        print()
+        print("The graph model with errors reuses these modules of the graph model's operators: "
+              + ', '.join(f'`{modname(un)}` ({self.ulines(un)})' for un in used) + '.')
+        print()
+
+
+def assurance(c):
+    """The assurance of the typed pipeline (not in the totals, nor in the
+    comparison): what checks that X86ᵀ is faithful to untyped X86."""
+    print(f'| assurance (not in the totals) | {UNIT} |')
+    print('|---|---:|')
+    for side, gname, _ in GROUPS:
+        if side == 'assure':
+            print(f'| {gname} | {c.counts[(side, gname)]} |')
+    print(f'| the statements (`Theorems/X86Erasure.agda`) | {code_lines(ASSURE_THM)} |')
+    print()
+
+
+def compare(c, T, Un):
+    """The typed pipeline against the untyped one, column by column (the lower
+    of the two is bold in each column); the totals with and without cast
+    insertion, which the untyped pipeline does not have."""
+    cols = list(zip(T['mcols'], Un['mcols']))
+    print('| typed against untyped | '
+          + ' | '.join(f'{label(t)}: untyped | {label(t)}: typed' for t, _ in cols) + ' |')
+    print('|---|' + '---:|' * (2 * len(cols)))
+    rows = ROWS + [EXTRA, 'prim']
+    for r in rows:
+        cells = []
+        for t, un in cols:
+            cells += bold_min([Un['cells'].get((un, r)), T['cells'].get((t, r))])
+        if any(x != '—' for x in cells):
+            rname = "the graph model's meaning of the primitives" if r == 'prim' else r
+            print(f'| {rname} | ' + ' | '.join(cells) + ' |')
+    cells = []
+    for t, un in cols:
+        cells += bold_min([Un['total'][un], T['total'][t]])
+    print('| **total** | ' + ' | '.join(cells) + ' |')
+    cells = []
+    for t, un in cols:
+        cells += bold_min([Un['total'][un], T['total'][t] - (T['cells'].get((t, 'cast insertion')) or 0)])
+    print('| **total without cast insertion** | ' + ' | '.join(cells) + ' |')
+    print()
+    print('| adequacy, typed against untyped | graph model: untyped | graph model: typed '
+          '| graph model with errors: untyped | graph model with errors: typed |')
+    print('|---|---:|---:|---:|---:|')
+    print('| **total** | ' + ' | '.join(bold_min([Un['adq'][UNTYPED['adeq']], T['adq'][TYPED['adeq']]])
+                                       + bold_min([Un['adq'][UNTYPED['gadeq']], T['adq'][TYPED['gadeq']]])) + ' |')
+    print()
+
+
+# --- FPC against the ISWIM pipeline, row by row (--mu-detail) -----------
+
+# the rows of FPC, and the files of the typed ISWIM pipeline it compares
+# with, for the graph model ('den') and the CEK machines ('op'): the
+# semantics of each language (its definitions and lemmas), what the
+# languages share, the lemmas the passes share, the passes from enclose to
+# select, and the composition (row, typed graph, typed CEK, μ graph, μ CEK).
+# Monᵀ and Monμ have no semantics of their own (their embedding into Clos5).
+# The typed graph model's Ops has project (with fun₂/fun₄) and the tables,
+# FPC's only the tables; the typed CEK lemmas Common collect a tuple's
+# values with its length equation.
+
+
+def mu_sem(x, typed_graph_lemmas=False, mu_graph_lemmas=False):
+    """The row of the semantics of language x."""
+    return (f'semantics: {x}',
+            [G + f'Typed/{x}.agda'] + ([GP + f'Typed/{x}.agda'] if typed_graph_lemmas else []),
+            [O + f'Typed/{x}.agda'],
+            [MU + f'Semantics/GraphModel/{ml(x)}.agda'] + ([MUP + f'Semantics/GraphModel/{ml(x)}.agda'] if mu_graph_lemmas else []),
+            [MU + f'Semantics/AbstractMachines/{ml(x)}.agda'])
+
+
+def mu_pass(row, graph, cek):
+    """The row of a pass, whose proofs have the same names in both pipelines."""
+    return (row, [GC + g for g in graph], [OC + o for o in cek],
+            [MUP + 'Correctness/GraphModel/' + g for g in graph], [MUP + 'Correctness/AbstractMachines/' + o for o in cek])
+
+
+MU_SPLIT = ['Rel', 'Preserve', 'Reflect', 'Correct']
+
+
+def mu_split(x):
+    """FPC's files of split's graph-model module x: its relation, Rel, is
+    split into the approximant logical relation (ApproxLR) and SplitRel."""
+    return ([MUP + 'Correctness/GraphModel/ApproxLR.agda'] if x == 'Rel' else []) \
+        + [MUP + 'Correctness/GraphModel/Split' + x + '.agda']
+
+
+MU_ROWS = [
+    mu_sem('ISWIM'),
+    mu_sem('Clos2', True, True),
+    mu_sem('Clos3', True, True),
+    mu_sem('Clos4', True, True),
+    mu_sem('Clos5', True, True),
+    mu_sem('Imp'),
+    mu_sem('CFG', True, True),
+    mu_sem('X86'),
+    ('what the languages share: project (typed only), tables (`Ops`), the values of the μ machines',
+     [G + 'Typed/Ops.agda', GP + 'Typed/Ops.agda'], [],
+     [MU + 'Semantics/GraphModel/Ops.agda', MUP + 'Semantics/GraphModel/Ops.agda'], [MU + 'Semantics/AbstractMachines/Values.agda']),
+    ('lemmas shared by the passes (`Common`, `Clos5Common`)', [], [OC + 'Common.agda', OC + 'Clos5Common.agda'],
+     [], [MUP + 'Correctness/AbstractMachines/GlobalFunCommon.agda', MUP + 'Semantics/AbstractMachines/Rel.agda']),
+    mu_pass('CC: capture', ['CaptureCorrect.agda'], ['CaptureSim.agda']),
+    mu_pass('CC: prune', ['PruneCorrect.agda'], ['PruneSim.agda']),
+    mu_pass('CC: concretize', ['ConcretizeCorrect.agda'], ['ConcretizeSim.agda']),
+    ('CC: split', [GC + 'Split' + x + '.agda' for x in MU_SPLIT], [OC + 'SplitSim.agda'],
+     [f for x in MU_SPLIT for f in mu_split(x)], [MUP + 'Correctness/AbstractMachines/SplitSim.agda']),
+    mu_pass('CC: hoist', ['HoistCorrect.agda'], ['HoistSim.agda']),
+    mu_pass('rco', ['RCOCorrect.agda'], ['RCOSim.agda']),
+    mu_pass('lift locals', ['LiftLocalsCorrect.agda'], ['LiftLocalsSim.agda']),
+    mu_pass('explicate control', ['ExplicateCorrect.agda'], ['ExplicateSim.agda']),
+    mu_pass('select instructions', ['SelectCorrect.agda'], ['SelectSim.agda']),
+    mu_pass('composition', ['CompilerCorrect.agda'], ['PipelineSim.agda']),
+]
+MU_SHARED = ([L + 'Typed/' + x + '.agda'
+              for x in ('Type', 'ISWIM', 'Clos2', 'Clos3', 'Clos4', 'Clos5', 'Mon', 'Imp', 'CFG', 'X86')]
+             + [C + x + '.agda' for x in ('Capture', 'Prune', 'Concretize', 'Split', 'Hoist', 'RCO',
+                                          'LiftLocals', 'Explicate', 'Select', 'Pipeline')])
+MU_INFRA = [W + 'VecUtil.agda', W + 'VecSelect.agda', WP + 'VecSelect.agda', WP + 'Lookup.agda']
+
+
+def mu_check(c):
+    """FPC's columns are independent of each other and of the proofs of
+    either pipeline (they may use what both pipelines share), and its
+    infrastructure imports only infrastructure."""
+    sides = ('mu-den', 'mu-op', 'mu-ck')
+    own = {s: {un for un, (side, _) in c.group_of.items() if s in sides_of(side)} for s in sides}
+    reach = {s: reachable(own[s], c.graph) for s in sides}
+    typed, untyped = set(TYPED['sides']) | {'gerr', 'adeq', 'gadeq'}, set(UNTYPED['sides']) | {'ugerr', 'uadeq', 'ugadeq'}
+    for s in sides:
+        bad = set()
+        for un in reach[s]:
+            side = c.group_of[un][0]
+            if (set(sides_of(side)) & set(sides) and s not in sides_of(side)) \
+                    or set(sides_of(side)) & {'mu-adeq', 'mu-adeq-cek', 'mu-adeq-red', 'mu-noerr', 'mu-examples', 'mu-mix'}:
+                bad.add(un)
+            ss = set(sides_of(side))
+            if ss <= set(STYLE) and not (ss & typed and ss & untyped):
+                bad.add(un)
+        if bad:
+            sys.exit(f'{s} imports modules of another proof:\n  ' + '\n  '.join(sorted(bad)))
+    minfra = {un for un, (side, _) in c.group_of.items() if side == 'mu-infra'}
+    bad = sorted(reachable(minfra, c.graph) - minfra - c.infra)
+    if bad:
+        sys.exit("FPC's infrastructure imports modules that are not infrastructure:\n  " + '\n  '.join(bad))
+
+
+def mu_report(c, T):
+    """FPC against the typed ISWIM pipeline, row by row, in the graph
+    model and the CEK machines; and against the totals of the main table
+    without simplify and cast insertion."""
+
+    def n(fs):
+        return sum(code_lines(f) for f in fs) if fs else None
+
+    def cell(x):
+        return '—' if x is None else str(x)
+    print('| FPC against the ISWIM pipeline | graph model: typed | graph model: μ '
+          '| CEK: typed | CEK: μ |')
+    print('|---|---:|---:|---:|---:|')
+    tot = [0, 0, 0, 0]
+    for row, gt, ot, gm, om in MU_ROWS:
+        ns = [n(gt), n(gm), n(ot), n(om)]
+        tot = [t + (x or 0) for t, x in zip(tot, ns)]
+        print(f'| {row} | ' + ' | '.join(cell(x) for x in ns) + ' |')
+    print('| **total** | ' + ' | '.join(str(t) for t in tot) + ' |')
+    # the main table's totals of the typed pipeline, without simplify and
+    # cast insertion: they also count untyped ISWIM's semantics and the
+    # primitives' (which simplify needs), the untyped ISWIM machine and the
+    # framework instances, and the observations
+    cells, total = T['cells'], T['total']
+    main_tot = {s: total[s] - (cells[(s, 'simplify')] or 0) - (cells[(s, 'cast insertion')] or 0)
+                for s in ('den', 'op')}
+    print(f"| the main table's total, without simplify and cast insertion | {main_tot['den']} | — "
+          f"| {main_tot['op']} | — |")
+    print()
+    print('| graph-model split, by module | typed | μ |')
+    print('|---|---:|---:|')
+    for x in MU_SPLIT:
+        print(f'| `Split{x}` | {code_lines(GC + "Split" + x + ".agda")} '
+              f'| {sum(code_lines(f) for f in mu_split(x))} |')
+    print()
+    print('| not counted in the rows | typed | μ |')
+    print('|---|---:|---:|')
+    mush = [f for f in c.every if c.seen[f][0] == 'mu-shared']
+    print(f'| languages and passes (ISWIM … X86, enclose … select, and their composition; μ also simplify, with the renaming of FPC) | {n(MU_SHARED)} | {n(mush)} |')
+    mui = [f for f in c.every if c.seen[f][0] == 'mu-infra']
+    print(f'| infrastructure: vectors and lookup lemmas (`VecUtil`, `VecSelect`, `proof/Framework/Lookup`) '
+          f'against heterogeneous vectors (`FPC/Framework/AllUtil`, `AllProp`) '
+          f'| {n(MU_INFRA)} | {n(mui)} |')
+    mex = [f for f in c.every if c.seen[f][0] == 'mu-examples']
+    print(f'| examples | — | {n(mex)} |')
+    print()
+
+
+# the clocked interpreters of FPC ('mu-ck') against the typed
+# pipeline's, row by row: the interpreter of each language, the values
+# they share and the value relations, and each pass.  The typed column is
+# without simplify and cast insertion, which FPC does not have.
+MU_CK_ROWS = [
+    ('semantics: ISWIM', [F + 'Typed/ISWIM.agda'], [MU + 'Semantics/ClockedInterpreters/FPC.agda']),
+    ('semantics: Clos2', [F + 'Typed/Clos2.agda'], [MU + 'Semantics/ClockedInterpreters/Clos.agda']),
+    ('semantics: Clos3', [F + 'Typed/Clos3.agda'], [MU + 'Semantics/ClockedInterpreters/EnvClos.agda']),
+    ('semantics: Clos4', [F + 'Typed/Clos4.agda'], [MU + 'Semantics/ClockedInterpreters/PairClos.agda']),
+    ('semantics: Clos5 (with the lemmas about Mon\'s embedding)', [F + 'Typed/Clos5.agda', FP + 'Typed/Clos5.agda'],
+     [MU + 'Semantics/ClockedInterpreters/GlobalFun.agda', MUP + 'Semantics/ClockedInterpreters/GlobalFun.agda']),
+    ('semantics: Imp', [F + 'Typed/Imp.agda'], [MU + 'Semantics/ClockedInterpreters/Imp.agda']),
+    ('semantics: CFG', [F + 'Typed/CFG.agda'], [MU + 'Semantics/ClockedInterpreters/CFG.agda']),
+    ('semantics: X86', [F + 'Typed/X86.agda'], [MU + 'Semantics/ClockedInterpreters/X86.agda']),
+    ('semantics: values (`Values`)', [F + 'Typed/Values.agda'], [MU + 'Semantics/ClockedInterpreters/Values.agda']),
+    ('semantics: value relations (`Rel`)', [FP + 'Typed/Rel.agda'], [MUP + 'Semantics/ClockedInterpreters/Rel.agda']),
+    ('CC: capture', [FC + 'CaptureFuel.agda'], [MUP + 'Correctness/ClockedInterpreters/CaptureFuel.agda']),
+    ('CC: prune', [FC + 'PruneFuel.agda'], [MUP + 'Correctness/ClockedInterpreters/PruneFuel.agda']),
+    ('CC: concretize', [FC + 'ConcretizeFuel.agda'], [MUP + 'Correctness/ClockedInterpreters/ConcretizeFuel.agda']),
+    ('CC: split', [FC + 'SplitFuel.agda'], [MUP + 'Correctness/ClockedInterpreters/SplitFuel.agda']),
+    ('CC: hoist', [FC + 'HoistFuel.agda'], [MUP + 'Correctness/ClockedInterpreters/HoistFuel.agda']),
+    ('rco', [FC + 'RCOFuel.agda'], [MUP + 'Correctness/ClockedInterpreters/RCOFuel.agda']),
+    ('lift locals', [FC + 'LiftLocalsFuel.agda'], [MUP + 'Correctness/ClockedInterpreters/LiftLocalsFuel.agda']),
+    ('explicate control', [FC + 'ExplicateFuel.agda'], [MUP + 'Correctness/ClockedInterpreters/ExplicateFuel.agda']),
+    ('select instructions', [FC + 'SelectFuel.agda'], [MUP + 'Correctness/ClockedInterpreters/SelectFuel.agda']),
+]
+
+
+def mu_ck_report(c):
+    """FPC's clocked interpreters against the typed ISWIM pipeline's."""
+
+    def n(fs):
+        return sum(code_lines(f) for f in fs) if fs else None
+
+    def cell(x):
+        return '—' if x is None else str(x)
+    print('| FPC against the ISWIM pipeline | interpreter: typed | interpreter: μ |')
+    print('|---|---:|---:|')
+    tot = [0, 0]
+    for row, ft, fm in MU_CK_ROWS:
+        ns = [n(ft), n(fm)]
+        tot = [t + (x or 0) for t, x in zip(tot, ns)]
+        print(f'| {row} | ' + ' | '.join(cell(x) for x in ns) + ' |')
+    print('| **total** | ' + ' | '.join(str(t) for t in tot) + ' |')
+    comp = [n([FC + 'CompilerFuel.agda']), n([MUP + 'Correctness/ClockedInterpreters/CompilerFuel.agda'])]
+    tot = [t + x for t, x in zip(tot, comp)]
+    print('| composition | ' + ' | '.join(cell(x) for x in comp) + ' |')
+    print('| **total with the composition** | ' + ' | '.join(str(t) for t in tot) + ' |')
+    print()
+
+
+# --- FPC's reduction column, row by row ------------------------------------
+# rows (name, typed files, μ files), like for like: the typed reduction
+# column without simplify and cast insertion (and without the reduction
+# semantics of untyped ISWIM, which only their proofs use)
+# (FPC's renaming and substitution, FPC/Language/FPCSubst.agda, are
+# shared with simplify, and so not counted in the main table; here they
+# stay in ISWIM's row, like for like with ISWIMᵀ's, whose kit is in its
+# reduction semantics)
+MU_RED_ROWS = [
+    ('semantics: ' + x, [RD + 'Typed/' + x + '.agda', RP + 'Typed/' + x + '.agda'],
+     [MU + 'Semantics/ReductionSemantics/' + ml(x) + '.agda', MUP + 'Semantics/ReductionSemantics/' + ml(x) + '.agda']
+     + ([MU + 'Language/FPCSubst.agda'] if x == 'ISWIM' else []))
+    for x in ('ISWIM', 'Clos2', 'Clos3', 'Clos4', 'Clos5')] + [
+    ('semantics: transition systems (shared)', [SRD + 'Smallstep.agda'], [SRD + 'Smallstep.agda']),
+    ('semantics: machines of Clos5, Imp, CFG, X86 (the CEK column\'s)',
+     [O + 'Typed/' + x + '.agda' for x in ('Clos5', 'Imp', 'CFG', 'X86')],
+     [MU + 'Semantics/AbstractMachines/' + x + '.agda' for x in ('GlobalFun', 'Imp', 'CFG', 'X86')]),
+    ('semantics: the CEK framework at this compiler\'s observations (shared)',
+     [SO + 'Smallstep.agda', SOP + 'Smallstep.agda', SOP + 'Simulation.agda'],
+     [SO + 'Smallstep.agda', SOP + 'Smallstep.agda', SOP + 'Simulation.agda']),
+    ('CC: capture', [RC + 'CaptureRed.agda'], [MUP + 'Correctness/ReductionSemantics/CaptureRed.agda']),
+    ('CC: prune', [RC + 'PruneRed.agda'], [MUP + 'Correctness/ReductionSemantics/PruneRed.agda']),
+    ('CC: concretize', [RC + 'ConcretizeRed.agda'], [MUP + 'Correctness/ReductionSemantics/ConcretizeRed.agda']),
+    ('CC: split', [RC + 'SplitRed.agda'], [MUP + 'Correctness/ReductionSemantics/SplitRed.agda']),
+    ('CC: hoist', [RC + 'HoistRed.agda'], [MUP + 'Correctness/ReductionSemantics/HoistRed.agda']),
+    ('rco', [RC + 'RCORed.agda'], [MUP + 'Correctness/ReductionSemantics/RCORed.agda']),
+    ('lift locals', [RC + 'LiftLocalsRed.agda'], [MUP + 'Correctness/ReductionSemantics/LiftLocalsRed.agda']),
+    ('explicate control (the CEK column\'s)', [OC + 'ExplicateSim.agda'], [MUP + 'Correctness/AbstractMachines/ExplicateSim.agda']),
+    ('select instructions (the CEK column\'s)', [OC + 'SelectSim.agda'], [MUP + 'Correctness/AbstractMachines/SelectSim.agda']),
+]
+MU_RED_COMP = ([RC + 'PipelineRed.agda'], [MUP + 'Correctness/ReductionSemantics/PipelineRed.agda'])
+# what FPC's reduction column shares with its CEK column
+MU_RED_SHARED = ([MU + 'Semantics/AbstractMachines/' + x + '.agda' for x in ('GlobalFun', 'Imp', 'CFG', 'X86')]
+                 + [MUP + 'Correctness/AbstractMachines/' + x + 'Sim.agda' for x in ('Explicate', 'Select')])
+
+
+def mu_red_check(c):
+    """As mu_check, for FPC's reduction column: it reaches no module of
+    another of FPC's columns (those it shares with one, 'mu-op+mu-red',
+    apart) nor of a proof of either pipeline (what both share apart), and its
+    infrastructure imports only infrastructure."""
+    shared = {unit(f) for f in MU_RED_SHARED}
+    own = {un for un, (side, _) in c.group_of.items() if 'mu-red' in sides_of(side)} | shared
+    typed, untyped = set(TYPED['sides']) | {'gerr', 'adeq', 'gadeq'}, set(UNTYPED['sides']) | {'ugerr', 'uadeq', 'ugadeq'}
+    bad = set()
+    for un in reachable(own, c.graph):
+        side = c.group_of[un][0]
+        ss = set(sides_of(side))
+        if side.startswith('mu-') and 'mu-red' not in ss and un not in shared \
+                and side not in ('mu-shared', 'mu-infra', 'mu-rinfra'):
+            bad.add(un)
+        if ss <= set(STYLE) and not (ss & typed and ss & untyped):
+            bad.add(un)
+    if bad:
+        sys.exit('mu-red imports modules of another proof:\n  ' + '\n  '.join(sorted(bad)))
+    rinfra = {un for un, (side, _) in c.group_of.items() if side in ('mu-infra', 'mu-rinfra')}
+    bad = sorted(reachable(rinfra, c.graph) - rinfra - c.infra)
+    if bad:
+        sys.exit("FPC's reduction infrastructure imports modules that are not infrastructure:\n  "
+                 + '\n  '.join(bad))
+
+
+def mu_red_report(c):
+    """FPC's reduction column against the typed ISWIM one, row by row."""
+
+    def n(fs):
+        fs = [f for f in fs if os.path.exists(f)]
+        return sum(code_lines(f) for f in fs) if fs else None
+
+    def cell(x):
+        return '—' if x is None else str(x)
+    print('| FPC against the ISWIM pipeline: reduction | typed | μ |')
+    print('|---|---:|---:|')
+    tot = [0, 0]
+    for row, t, m in MU_RED_ROWS:
+        ns = [n(t), n(m)]
+        tot = [a + (x or 0) for a, x in zip(tot, ns)]
+        print(f'| {row} | ' + ' | '.join(cell(x) for x in ns) + ' |')
+    print('| **total** | ' + ' | '.join(str(x) for x in tot) + ' |')
+    print('| composition | '
+          + ' | '.join(cell(n(fs)) for fs in MU_RED_COMP) + ' |')
+    print('| **total with the composition** | '
+          + ' | '.join(str(x + n(fs)) for x, fs in zip(tot, MU_RED_COMP)) + ' |')
+    T = c.analyze(TYPED)
+    main = T['total']['red'] - (T['cells'][('red', 'simplify')] or 0) - (T['cells'][('red', 'cast insertion')] or 0)
+    print(f"| the main table's total, without simplify and cast insertion | {main} | — |")
+    print()
+    print('| reduction: not counted in the rows | typed | μ |')
+    print('|---|---:|---:|')
+    print(f'| reduction of vectors (`ReductionVec`) against heterogeneous vectors (`FPC/Framework/ReductionAll`) '
+          f'| {n([W + "ReductionVec.agda", WP + "ReductionVec.agda"])} '
+          f'| {n([MU + "Framework/ReductionAll.agda", MUP + "Framework/ReductionAll.agda"])} |')
+    print()
+
+
+# --- FPC's main table: the four styles against each other --------------
+
+MU_SIDES = ('mu-den', 'mu-op', 'mu-ck', 'mu-red')
+# adequacy (for the interpreters), and its alternative for the CEK machines
+MU_ADEQ = ('mu-adeq', 'mu-adeq-cek', 'mu-adeq-red')
+MU_LABELS = {'mu-den': 'denotational: graph model', 'mu-op': 'CEK machine + simulation',
+             'mu-ck': 'clocked interpreter + value relations', 'mu-red': 'reduction semantics + simulation',
+             'mu-adeq': 'adequacy', 'mu-adeq-cek': 'adequacy for the CEK machines',
+             'mu-adeq-red': 'adequacy for the reduction semantics'}
+SEM = 'semantics of the languages'
+MU_BORROWED = "the modules it shares with the ISWIM pipeline (meaning of the primitives, framework instances)"
+# FPC as a pipeline, for the audit-surface table (it has no graph model
+# with errors)
+MU_P = dict(sides=MU_SIDES, gerr=None, adeq='mu-adeq',
+            thm={'mu-den': MU + 'Theorems/CorrectWrtGraphModel.agda', 'mu-op': MU + 'Theorems/CorrectWrtAbstractMachines.agda',
+                 'mu-ck': MU + 'Theorems/CorrectWrtClockedInterpreters.agda', 'mu-red': MU + 'Theorems/CorrectWrtReductionSemantics.agda',
+                 'mu-adeq': MU + 'Theorems/GraphModelAdequateWrtClockedInterpreters.agda',
+                 'mu-adeq-cek': MU + 'Theorems/GraphModelAdequateWrtAbstractMachines.agda',
+                 'mu-adeq-red': MU + 'Theorems/GraphModelAdequateWrtReductionSemantics.agda'},
+            name='FPC')
+
+
+def mu_analyze(c):
+    """FPC's counts, as analyze's for a pipeline: each column's rows, the
+    shared modules (languages, passes, the primitives, the observations) it
+    reaches that the four do not all reach, and the modules of the typed
+    pipeline it reuses (the meaning of the primitives, the instances of the
+    frameworks at this compiler's observations), counted where they are used;
+    adequacy as an add-on to the graph model (and its alternative for the
+    CEK machines likewise)."""
+    cols = MU_SIDES + MU_ADEQ
+    own = {s: {un for un, (side, _) in c.group_of.items() if s in sides_of(side)} for s in cols}
+    reach = {s: reachable(own[s], c.graph) for s in cols}
+    shared = {un for un, (side, _) in c.group_of.items() if side in ('shared', 'mu-shared')}
+    by_all = shared.intersection(*(reach[s] for s in MU_SIDES))
+    extra = {s: (shared & reach[s]) - by_all for s in MU_SIDES}
+    for a in MU_ADEQ:
+        extra[a] = (shared & reach[a]) - by_all - extra['mu-den']
+    minfra = {un for un, (side, _) in c.group_of.items() if side in ('mu-infra', 'mu-rinfra')}
+
+    def borrowed_of(s):
+        return {un for un in reach[s] if not c.group_of[un][0].startswith('mu-')
+                and un not in c.infra and un not in shared}
+    borrowed = {s: borrowed_of(s) for s in MU_SIDES}
+    for a in MU_ADEQ:
+        borrowed[a] = borrowed_of(a) - borrowed['mu-den']
+    total = {}
+    for s in cols:
+        rows = ROWS if s not in MU_ADEQ else [g for _, g, _ in GROUPS]
+        total[s] = (sum(c.counts.get((s, r)) or 0 for r in dict.fromkeys(rows))
+                    + c.lines(extra[s]) + c.lines(borrowed[s]))
+    freach = {s: c.closure(f for un in own[s] for f in c.files_of_unit[un]) for s in cols}
+    return dict(own=own, reach=reach, freach=freach, extra=extra, borrowed=borrowed, total=total,
+                by_all=by_all, minfra=minfra)
+
+
+def mu_main(c, T, M):
+    """The four styles against each other on FPC, in the shape of the
+    pipelines' main table; then adequacy, the no-error lemmas, the
+    infrastructure by use, the audit surface and the shared modules."""
+    print('| component (FPC) | ' + ' | '.join(MU_LABELS[s] for s in MU_SIDES) + ' |')
+    print('|---|' + '---:|' * len(MU_SIDES))
+    # the shared modules a column reaches that not all four do (the
+    # observations), and the modules it shares with the ISWIM pipeline (the meaning
+    # of the primitives, framework instances), are counted in its semantics row
+    for r in ROWS:
+        ns = [c.counts.get((s, r)) for s in MU_SIDES]
+        if r == SEM:
+            ns = [(n or 0) + c.lines(M['extra'][s]) + c.lines(M['borrowed'][s]) or None
+                  for n, s in zip(ns, MU_SIDES)]
+        if any(n is not None for n in ns):
+            print(f'| {r} | ' + ' | '.join(bold_min(ns)) + ' |')
+    print('| **total** | ' + ' | '.join(bold_min([M['total'][s] for s in MU_SIDES])) + ' |')
+    print()
+    mush = {un for un, (side, _) in c.group_of.items() if side == 'mu-shared'}
+    print(f"Shared by all four, not counted: FPC's languages and passes ({c.lines(mush & M['by_all'])} {UNIT}) "
+          f"and {c.lines(M['by_all'] - mush)} {UNIT} of the ISWIM pipeline's (the primitives, registers).")
+    for s in MU_SIDES:
+        if M['extra'][s] or M['borrowed'][s]:
+            print(f'Counted in the semantics row of {MU_LABELS[s]}: '
+                  + ', '.join(f'{c.display(un)} ({c.ulines(un)})' for un in sorted(M['extra'][s] | M['borrowed'][s])) + '.')
+    print()
+
+    # adequacy, against the ISWIM pipeline's (plain graph model): FPC's
+    # for the interpreters, and its alternative for the CEK machines
+    TA = TYPED['adeq']
+    rows = [('ISWIM', 'ISWIM: the source (typed: untyped ISWIM\'s machine, shared with the untyped pipeline)', 'ISWIM'),
+            ('Clos5', 'Clos5: the values of its machine or interpreter and the tables, which X86 adequacy uses '
+                      '(typed: also the adequacy of the Clos5ᵀ machine)', 'Clos5'),
+            ('X86ᵀ', 'X86: the target, direct', 'X86'),
+            ('well-formedness of compiled programs', 'well-formedness of compiled programs',
+             'well-formedness of compiled programs'),
+            ('end to end', 'end to end', 'end to end')]
+    adqs = ('mu-adeq-cek', 'mu-adeq-red', 'mu-adeq')
+    print('| adequacy of the graph model (reported separately) | ISWIM pipeline: CEK machines '
+          '| FPC: CEK machines (alternative) | FPC: reduction semantics (alternative) | FPC: interpreters |')
+    print('|---|---:|---:|---:|---:|')
+    for tr, label_, mr in rows:
+        print(f'| {label_} | ' + ' | '.join(bold_min([c.counts.get((TA, tr))] + [c.counts.get((a, mr)) for a in adqs])) + ' |')
+    print(f'| {EXTRA}, nor by the graph model | '
+          + ' | '.join(bold_min([c.lines(T['extra'][TA]) or None]
+                                + [c.lines(M['extra'][a]) or None for a in adqs])) + ' |')
+    print(f"| {MU_BORROWED.replace('it reuses', 'μ reuses')}, nor by the graph model | — | "
+          + ' | '.join(str(c.lines(M['borrowed'][a]) or '—') for a in adqs) + ' |')
+    print('| **total** | ' + ' | '.join(bold_min([T['adq'][TA]] + [M['total'][a] for a in adqs])) + ' |')
+    print()
+    for a in ('mu-adeq', 'mu-adeq-cek', 'mu-adeq-red'):
+        print(f'Counted in μ {MU_LABELS[a]}: '
+              + ', '.join(f'{c.display(un)} ({c.ulines(un)})'
+                          for un in sorted(M['extra'][a] | M['borrowed'][a])) + '.')
+    print()
+    print('Only FPC\'s adequacy for the interpreters is in its totals (and in the graph model\'s '
+          f"total to running code, {M['total']['mu-den']} + {M['total']['mu-adeq']} = "
+          f"{M['total']['mu-den'] + M['total']['mu-adeq']}); the alternatives for the CEK machines and for "
+          'the reduction semantics are shown for comparison. The tuples of sets, the tables\' lemmas and '
+          'the well-formedness of compiled programs are in all three columns, and the X86μ rows of the '
+          'two alternatives (the X86μ machine) are in both.')
+    print()
+    print(f'| no-error lemmas (not in any total) | {UNIT} |')
+    print('|---|---:|')
+    tot = 0
+    for side, gname, _ in GROUPS:
+        if side == 'mu-noerr':
+            tot += c.counts[(side, gname)]
+            print(f'| {gname} | {c.counts[(side, gname)]} |')
+    print(f'| **total** | {tot} |')
+    print()
+
+    # infrastructure by use
+    cols = MU_SIDES + ('mu-adeq',)
+    print(f'| language-independent infrastructure (FPC, not in the totals) | {UNIT} | '
+          + ' | '.join(f'used by {MU_LABELS[s]}' for s in cols) + ' |')
+    print('|---|---:|' + '---:|' * len(cols))
+    itotal = {s: 0 for s in cols}
+    seen_groups = []
+    for side, gname, _ in GROUPS:
+        if side in ('infra', 'mu-infra', 'mu-rinfra') and (side, gname) not in seen_groups:
+            seen_groups.append((side, gname))
+            us = {unit(f) for f in c.files_of[(side, gname)]}
+            row = []
+            for s in cols:
+                n = c.ilines(us, M['freach'][s] - (M['freach']['mu-den'] if s == 'mu-adeq' else set()))
+                itotal[s] += n
+                row.append(str(n) if n else '—')
+            if any(r != '—' for r in row):
+                name_ = gname + (' (FPC\'s)' if side != 'infra' else '')
+                print(f'| {name_} | {c.lines(us)} | ' + ' | '.join(row) + ' |')
+    print('| **total** | — | ' + ' | '.join(str(itotal[s]) for s in cols) + ' |')
+    print()
+    print('Adequacy\'s column counts only the infrastructure that the graph model does not use.')
+    print()
+
+    c.print_audit(MU_P)
+    if c.munreached:
+        print('Not on the audit surface: the semantics of the intermediate languages, outside FPC/proof/ '
+              'but reached by no theorem statement (only the proofs use them): '
+              f'{len(c.munreached)} modules, {sum(code_lines(f) for f in c.munreached)} {UNIT}.')
+        print()
+    mu_modules(c, M)
+
+
+def mu_modules(c, M):
+    """The modules that FPC's proofs share with each other, those of the
+    ISWIM pipeline it reuses, and its infrastructure, with their users."""
+    cols = MU_SIDES + ('mu-adeq',)
+    reach = M['reach']
+    shared = {un for un, (side, _) in c.group_of.items() if side in ('shared', 'mu-shared')}
+    print(f'| shared module (FPC) | {UNIT} | used by |')
+    print('|---|---:|---|')
+    for un in sorted(shared, key=lambda x: c.display(x)):
+        users = [any_name(s) for s in cols if un in reach[s]]
+        if users:
+            who = 'all four proofs' if un in M['by_all'] else ', '.join(users)
+            print(f'| {c.display(un)} | {c.ulines(un)} | {who} |')
+    print()
+    reused = {un for s in cols for un in reach[s] if not c.group_of[un][0].startswith('mu-')
+              and un not in c.infra and un not in shared}
+    print(f"| the ISWIM pipeline's module reused by FPC | {UNIT} | used by |")
+    print('|---|---:|---|')
+    for un in sorted(reused, key=lambda x: c.display(x)):
+        print(f'| {c.display(un)} | {c.ulines(un)} | '
+              + ', '.join(any_name(s) for s in cols if un in reach[s]) + ' |')
+    print()
+    print(f'| infrastructure module (FPC) | {UNIT} | used by |')
+    print('|---|---:|---|')
+    for un in sorted(c.infra | M['minfra'], key=lambda x: c.display(x)):
+        users = [any_name(s) for s in cols if c.uses(un, M['freach'][s])]
+        if users:
+            print(f'| {c.display(un)} | {c.ulines(un)} | {", ".join(users)} |')
+    print()
+    mex = [f for f in c.every if c.seen[f][0] == 'mu-examples']
+    print(f"Examples, not counted: {sum(code_lines(f) for f in mex)} {UNIT}.")
+    print()
+    print("Module (+ proof/): the definitions are on the audit surface, the lemmas "
+          f"in its proof/ half; the {UNIT} are those of both.")
+    print()
+
+
+# --- mixing semantics (--mixed): the graph model and the interpreters ----------
+
+MIX_ROOT = MUP + 'Mixed/CompilerMixed.agda'
+MIX_PASSES = ['simplify', 'CC: capture', 'CC: prune', 'CC: concretize', 'CC: split', 'CC: hoist',
+              'rco', 'lift locals', 'explicate control', 'select instructions']
+# the passes that are cheaper in the graph model, and the languages at
+# which a proof of each in the graph model needs a bridge (its source and
+# its target), for the estimated splits
+MIX_LANGS = {'simplify': ['ISWIM'], 'CC: hoist': ['Clos4', 'Clos5'], 'explicate control': ['Imp', 'CFG']}
+
+
+def mixed_analyze(c, M):
+    """Split (a), measured: what the mixed composition reaches, by row and
+    style; the splits that also prove hoist and/or explicate control in
+    the graph model, estimated from the measured rows (each further bridge
+    at the size of FPC's, without the tuples of sets it would share)."""
+    reach = reachable({unit(MIX_ROOT)}, c.graph)
+    for un in reach:
+        side, row = c.group_of[un]
+        bridge = 'mu-adeq' in sides_of(side) and row == 'ISWIM'
+        if side.startswith('mu-') and side not in ('mu-shared', 'mu-infra', 'mu-rinfra', 'mu-mix') \
+                and not set(sides_of(side)) & {'mu-den', 'mu-ck'} and not bridge:
+            sys.exit(f'the mixed proof imports a module of {side}: {un}')
+        if set(sides_of(side)) & {'mu-op', 'mu-red'} and not set(sides_of(side)) & {'mu-den', 'mu-ck'}:
+            sys.exit(f'the mixed proof imports a module of {side}: {un}')
+    rows, style = {}, {}
+    for un in reach:
+        side, row = c.group_of[un]
+        ss = set(sides_of(side))
+        if side == 'mu-mix' or 'mu-adeq' in ss:
+            key = 'composition' if row == 'composition' else 'bridge'
+        elif ss & {'mu-den', 'mu-ck'}:
+            key = row
+            if row == 'semantics of the languages':
+                key = 'semantics: graph model' if side == 'mu-den' else 'semantics: interpreters'
+            if len(ss) == 1:
+                style.setdefault(key, set()).add(side)
+        else:
+            continue
+        rows[key] = rows.get(key, 0) + c.ulines(un)
+    shared = {un for un, (side, _) in c.group_of.items() if side in ('shared', 'mu-shared')}
+    extra = (shared & reach) - M['by_all']
+    borrowed = {un for un in reach if not c.group_of[un][0].startswith('mu-')
+                and un not in c.infra and un not in shared}
+    total = sum(rows.values()) + c.lines(extra) + c.lines(borrowed)
+    fmix = c.closure(f for un in reach if c.group_of[un][0] == 'mu-mix' for f in c.files_of_unit[un])
+    infra = c.ilines(c.infra | M['minfra'], fmix)
+    pure_infra = {s: c.ilines(c.infra | M['minfra'], M['freach'][s]) for s in ('mu-den', 'mu-ck')}
+    # the estimated splits
+    core = c.lines(un for un in reach if c.group_of[un] == ('mu-adeq', 'ISWIM'))
+
+    def gsem(langs):
+        return sum(code_lines(f) for x in langs
+                   for f in (MU + f'Semantics/GraphModel/{ml(x)}.agda', MUP + f'Semantics/GraphModel/{ml(x)}.agda')
+                   if os.path.exists(f))
+    splits = [('(a) simplify in the graph model', ['simplify'], total, True)]
+    for name_, more in (('(b) also hoist', ['CC: hoist']),
+                        ('(b) also explicate control', ['explicate control']),
+                        ('(c) the per-pass minimum: also hoist and explicate control',
+                         ['CC: hoist', 'explicate control'])):
+        t = total + gsem(['Ops'])
+        for r in more:
+            t += c.counts[('mu-den', r)] - c.counts[('mu-ck', r)] + gsem(MIX_LANGS[r]) + 2 * core
+        splits.append((name_, ['simplify'] + more, t, False))
+    return dict(reach=reach, rows=rows, style=style, extra=extra, borrowed=borrowed, total=total, infra=infra,
+                pure_infra=pure_infra, core=core, splits=splits)
+
+
+def mixed_brief(c, M, X):
+    """The splits against the pure columns, and the FPC bridge (FPC's
+    adequacy for its interpreter) against the alternative for the CEK
+    machine."""
+    about = {'mu-den': 'denotations', 'mu-op': 'the machines', 'mu-ck': 'the interpreters',
+             'mu-red': 'the reduction semantics'}
+    print('| proof of the FPC compiler | passes in the graph model | bridges | total | end theorem about |')
+    print('|---|---|---:|---:|---|')
+    for s in MU_SIDES:
+        print(f'| {MU_LABELS[s]} | {"all" if s == "mu-den" else "—"} | — | {M["total"][s]} | {about[s]} |')
+    print(f'| denotational: graph model, and its adequacy | all | — '
+          f'| {M["total"]["mu-den"] + M["total"]["mu-adeq"]} | the interpreters |')
+    print(f'| denotational: graph model, and its adequacy for the CEK machines (alternative) | all | — '
+          f'| {M["total"]["mu-den"] + M["total"]["mu-adeq-cek"]} | the machines |')
+    for name_, passes, t, measured in X['splits']:
+        nb = len({x for r in passes for x in MIX_LANGS[r]})
+        print(f'| mixed {name_}{"" if measured else " (estimate)"} | '
+              f'{", ".join(p.replace("CC: ", "") for p in passes)} | {nb} | {t if measured else "~" + str(t)} '
+              '| the interpreters |')
+    print()
+    print(f"The bridge at FPC (its graph semantics against its interpreter, both directions) is "
+          f"{X['rows']['bridge']} {UNIT}: it is the ISWIM row of the graph model's adequacy (for the "
+          f"interpreters), shared, against {c.counts[('mu-adeq-cek', 'ISWIM')]} for the FPC CEK machine. "
+          "Each total counts it once: the mixed totals stand alone, and are not added to adequacy's. "
+          f"The estimates count each further bridge at "
+          f"{X['core']} {UNIT} (the FPC bridge without the tuples of sets), each further language's graph "
+          "semantics and the tables (`Ops`), and no change to the composition.")
+    print()
+
+
+def mixed_report(c, M, X):
+    """Split (a) row by row against the two pure columns it draws on, the
+    bridge against the FPC adequacy for the CEK machine, and the
+    infrastructure used."""
+    print('| component (FPC) | mixed (a): proved by | mixed (a) | graph model | interpreter |')
+    print('|---|---|---:|---:|---:|')
+    rows, style = X['rows'], X['style']
+    print(f"| semantics: interpreters (all languages) | interpreter | {rows['semantics: interpreters']} | — "
+          f"| {c.counts[('mu-ck', 'semantics of the languages')]} |")
+    print(f"| semantics: graph model (FPC only) | graph model | {rows['semantics: graph model']} "
+          f"| {c.counts[('mu-den', 'semantics of the languages')]} | — |")
+    for r in MIX_PASSES:
+        by = 'graph model' if style.get(r) == {'mu-den'} else 'interpreter'
+        print(f"| {r} | {by} | {rows[r]} | {c.counts[('mu-den', r)]} | {c.counts[('mu-ck', r)]} |")
+    print(f"| bridge at FPC (FPC's adequacy, shared with the graph model's) | — | {rows['bridge']} | — | — |")
+    print(f"| composition | — | {rows['composition']} | {c.counts[('mu-den', 'composition')]} "
+          f"| {c.counts[('mu-ck', 'composition')]} |")
+    ex = [M['extra'][s] for s in ('mu-den', 'mu-ck')]
+    print(f"| {EXTRA} | — | {c.lines(X['extra'])} | {c.lines(ex[0]) or '—'} | {c.lines(ex[1]) or '—'} |")
+    print(f"| {MU_BORROWED} | — | {c.lines(X['borrowed'])} | {c.lines(M['borrowed']['mu-den']) or '—'} "
+          f"| {c.lines(M['borrowed']['mu-ck']) or '—'} |")
+    print(f"| **total** | — | **{X['total']}** | {M['total']['mu-den']} | {M['total']['mu-ck']} |")
+    print(f"| language-independent infrastructure used (not in the totals) | — | {X['infra']} "
+          f"| {X['pure_infra']['mu-den']} | {X['pure_infra']['mu-ck']} |")
+    print()
+    print('Counted in mixed (a): '
+          + ', '.join(f'{c.display(un)} ({c.ulines(un)})' for un in sorted(X['extra'] | X['borrowed'])) + '.')
+    print()
+    print('| FPC adequacy | w.r.t. the CEK machine (alternative) | w.r.t. the interpreter (the bridge) |')
+    print('|---|---:|---:|')
+    for label_, x in (('soundness', 'Soundness'), ('logical relation, fundamental lemma', 'LogRel'),
+                      ('statements (constants, convergence or divergence)', 'FPC')):
+        print(f'| {label_} | {code_lines(MUP + "Adequacy/AbstractMachines/" + x + ".agda")} | {code_lines(MUP + "Adequacy/" + x + ".agda")} |')
+    t = code_lines(MUP + 'Adequacy/Tuples.agda')
+    print(f'| tuples of sets (`FPC.proof.Adequacy.Tuples`, the same module) | {t} | {t} |')
+    print(f"| **total** | {c.counts[('mu-adeq-cek', 'ISWIM')]} | **{X['rows']['bridge']}** |")
+    print()
+
+
+def iswim_brief(c, T, M):
+    """The ISWIM pipeline against FPC, briefly: the totals per style (and
+    the graph model with errors), simplify and split, adequacy, and split in
+    the graph model by module."""
+    cells, total = T['cells'], T['total']
+    cols = TYPED['sides'] + (TYPED['gerr'],)
+    print('| per style | ' + ' | '.join(NAMES[STYLE[s]] for s in cols) + ' |')
+    print('|---|' + '---:|' * len(cols))
+    print('| ISWIM pipeline, total | ' + ' | '.join(str(total[s]) for s in cols) + ' |')
+    print('| ISWIM pipeline, total without cast insertion | '
+          + ' | '.join(str(total[s] - (cells[(s, 'cast insertion')] or 0)) for s in cols) + ' |')
+    print('| FPC, total | ' + ' | '.join(str(M['total'][s]) for s in MU_SIDES) + ' | — |')
+    for r, rname in (('simplify', 'simplify'), ('CC: split', 'split')):
+        print(f'| ISWIM pipeline: {rname} | ' + ' | '.join(str(cells[(s, r)]) for s in cols) + ' |')
+        print(f'| FPC: {rname} | ' + ' | '.join(str(c.counts[(s, r)]) for s in MU_SIDES) + ' | — |')
+    print()
+    print('| adequacy (reported separately) | graph model | graph model with errors |')
+    print('|---|---:|---:|')
+    print(f"| ISWIM pipeline | {T['adq'][TYPED['adeq']]} | {T['adq'][TYPED['gadeq']]} |")
+    print(f"| FPC | {M['total']['mu-adeq']} | — |")
+    print()
+    print('| graph-model split, by module | ISWIM pipeline | FPC |')
+    print('|---|---:|---:|')
+    for x in MU_SPLIT:
+        print(f'| `Split{x}` | {code_lines(GC + "Split" + x + ".agda")} '
+              f'| {sum(code_lines(f) for f in mu_split(x))} |')
+    print(f'| **total** | {sum(code_lines(GC + "Split" + x + ".agda") for x in MU_SPLIT)} '
+          f'| {sum(code_lines(f) for x in MU_SPLIT for f in mu_split(x))} |')
+    print()
+
+
+SC, SCP = MU + 'proof/Correctness/ScottDomains/', MU + 'proof/Semantics/ScottDomains/'
+SCOTT_ROWS = [
+    ('semantics of the languages', [MU + 'Semantics/ScottDomains/*.agda', A + 'Semantics/Scott/*.agda']),
+    ('lemmas shared by the passes', [SCP + '*.agda']),
+    ('simplify', [SC + 'SimplifyCorrect.agda', MUP + 'Compiler/SimplifyFacts.agda']),
+    ('CC: capture', [SC + 'CaptureCorrect.agda']),
+    ('CC: prune', [SC + 'PruneCorrect.agda']),
+    ('CC: concretize', [SC + 'ConcretizeCorrect.agda']),
+    ('CC: split', [SC + 'Split*.agda', WP + 'Scott/StageCall.agda']),
+    ('CC: hoist', [SC + 'HoistCorrect.agda']),
+    ('rco', [SC + 'RCOCorrect.agda']),
+    ('lift locals', [SC + 'LiftLocalsCorrect.agda']),
+    ('explicate control', [SC + 'ExplicateCorrect.agda']),
+    ('select instructions', [SC + 'SelectCorrect.agda']),
+    ('composition', [SC + 'CompilerCorrect.agda']),
+]
+# the adequacy of the Scott-domain semantics for the clocked interpreters
+# (reported separately, as the graph model's 'mu-adeq' is), by the rows of
+# the graph model's adequacy
+SA = MU + 'proof/Adequacy/ScottDomains/'
+SCOTT_ADEQ_ROWS = [
+    ('ISWIM', [SA + x + '.agda' for x in ('Soundness', 'LogRel', 'FPC')]),
+    ('Clos5', []),
+    ('X86', [SA + 'X86' + x + '.agda' for x in ('Frame', 'Soundness', 'LogRel', '')]),
+    ('well-formedness of compiled programs', [SA + 'X86Compiled.agda']),
+    ('end to end', [SA + 'EndToEnd.agda']),
+]
+SCOTT_INFRA = [
+    ('dcpos on TypeTopology: exponentials, products, powers, sums, lifting',
+     [W + 'Scott/Base.agda', W + 'Scott/Sum.agda', W + 'Scott/Lift.agda', WP + 'Scott/Sum.agda',
+      WP + 'Scott/Lift.agda']),
+    ('locally continuous functors, the solution of D ≅ F D as a bilimit',
+     [W + 'Scott/Functor.agda', W + 'Scott/Solve.agda', WP + 'Scott/Solve.agda']),
+    ('the domain of values and its operators',
+     [W + 'Scott/Domain.agda', WP + 'Scott/Domain.agda', W + 'Scott/Ops.agda', WP + 'Scott/Ops.agda',
+      WP + 'Scott/Values.agda']),
+    ('combinators for continuous meanings', [W + 'Scott/Semantics.agda', WP + 'Scott/Semantics.agda']),
+    ('the stages of the bilimit (approximations by depth)', [WP + 'Scott/Stages.agda']),
+]
+
+
+def scott_analyze(c, M):
+    """The Scott-domain column's counts: per row, the graph model's and the
+    Scott column's lines; the modules counted in the semantics rows; the
+    infrastructure, row by row; the theorem statements."""
+    def files(pats):
+        return sorted({f for p in pats for f in glob.glob(p)})
+    sf = scott_files()
+    rows = [(r, files(ps)) for r, ps in SCOTT_ROWS]
+    infra = [(r, files(ps)) for r, ps in SCOTT_INFRA]
+    thm = [MU + 'Theorems/CorrectWrtScottDomains.agda']
+    arows = [(r, files(ps)) for r, ps in SCOTT_ADEQ_ROWS]
+    athm = [MU + 'Theorems/ScottDomainsAdequateWrtClockedInterpreters.agda']
+    covered = ({f for _, fs in rows + infra + arows for f in fs} | set(thm) | set(athm)
+               | {A + 'AllScott.agda'})
+    missing = sorted(sf - covered)
+    if missing:
+        sys.exit('Scott files in no row:\n  ' + '\n  '.join(missing))
+    # what the proofs reach outside the column: shared modules of FPC not
+    # reached by all four, and the ISWIM pipeline's modules
+    seen, todo = set(), [f for _, fs in rows for f in fs]
+    while todo:
+        f = todo.pop()
+        if f not in seen:
+            seen.add(f)
+            todo.extend(g for g in imports(f) if g not in seen)
+    outside = {unit(f) for f in seen if f not in sf and f in c.every}
+    counted = {unit(f) for _, fs in rows for f in fs if f in c.every}
+    shared = {un for un, (side, _) in c.group_of.items() if side in ('shared', 'mu-shared')}
+    extra = (shared & outside) - M['by_all'] - counted
+    borrowed = {un for un in outside if not c.group_of[un][0].startswith('mu-')
+                and un not in c.infra and un not in shared}
+    # as in mu_main, modules reached outside the rows count in the semantics row
+    nx, nb = c.lines(extra), c.lines(borrowed)
+    gx = c.lines(M['extra']['mu-den']) + c.lines(M['borrowed']['mu-den'])
+    stotal = nx + nb
+    cells = []
+    for r, fs in rows:
+        n = sum(code_lines(f) for f in fs)
+        stotal += n
+        g = c.counts.get(('mu-den', r))
+        if r == SEM:
+            n, g = n + nx + nb, (g or 0) + gx
+        cells.append((r, g, n or None))
+    icells = [(r, sum(code_lines(f) for f in fs)) for r, fs in infra]
+    # adequacy: its own modules by row, and the modules of the graph model's
+    # adequacy that it reuses (lemmas about the interpreters only)
+    seen, todo = set(), [f for _, fs in arows for f in fs]
+    while todo:
+        f = todo.pop()
+        if f not in seen:
+            seen.add(f)
+            todo.extend(g for g in imports(f) if g not in seen)
+    areused = {unit(f) for f in seen if f not in sf and f in c.every and 'mu-adeq' in sides_of(c.group_of[unit(f)][0])}
+    acells = [(r, c.counts.get(('mu-adeq', r)), sum(code_lines(f) for f in fs) or None) for r, fs in arows]
+    atotal = sum(n or 0 for _, _, n in acells) + c.lines(areused)
+    return dict(cells=cells, total=stotal, extra=extra, borrowed=borrowed, infra=icells,
+                itotal=sum(n for _, n in icells), thm=sum(code_lines(f) for f in thm),
+                acells=acells, areused=areused, atotal=atotal, athm=sum(code_lines(f) for f in athm))
+
+
+def scott_report(c, M):
+    """The Scott-domain column against the graph model, row by row; then its
+    infrastructure and its theorem statements."""
+    S = scott_analyze(c, M)
+    extra, borrowed = S['extra'], S['borrowed']
+    print('| component (FPC) | denotational: graph model | denotational: Scott domains |')
+    print('|---|---:|---:|')
+    for r, g, n in S['cells']:
+        print(f'| {r} | ' + ' | '.join(bold_min([g, n])) + ' |')
+    print('| **total** | ' + ' | '.join(bold_min([M['total']['mu-den'], S['total']])) + ' |')
+    print()
+    if M['extra']['mu-den'] | M['borrowed']['mu-den']:
+        print('Counted in the graph model\'s semantics row: '
+              + ', '.join(f'{c.display(un)} ({c.ulines(un)})'
+                          for un in sorted(M['extra']['mu-den'] | M['borrowed']['mu-den'])) + '.')
+        print()
+    if extra | borrowed:
+        print('Counted in the Scott column\'s semantics row: ' + ', '.join(f'{c.display(un)} ({c.ulines(un)})'
+                                                                         for un in sorted(extra | borrowed)) + '.')
+        print()
+    print('The Scott column counts the meaning of the primitives (`Semantics.Scott.Prim`) in its '
+          "semantics row, and simplify's syntactic lemmas (`FPC.proof.Compiler.SimplifyFacts`) in its "
+          'simplify row, as the graph model does; its split row includes the calls of approximated '
+          'closures (`proof.Framework.Scott.StageCall`).')
+    print()
+    print(f'| infrastructure of the Scott column (not in the total) | {UNIT} |')
+    print('|---|---:|')
+    for r, n in S['infra']:
+        print(f'| {r} | {n} |')
+    print(f"| **total** | {S['itotal']} |")
+    print()
+    print(f"Theorem statements (FPC/Theorems/CorrectWrtScottDomains.agda): {S['thm']} {UNIT}.")
+    print()
+    print('| adequacy for the clocked interpreters (reported separately) | graph model | Scott domains |')
+    print('|---|---:|---:|')
+    for r, g, n in S['acells']:
+        print(f'| {ml(r)} | ' + ' | '.join(bold_min([g, n])) + ' |')
+    print('| reused from the graph model\'s adequacy (lemmas about the interpreters only) | — | '
+          + str(c.lines(S['areused']) or '—') + ' |')
+    print(f"| shared modules reached, not by the four columns | {c.lines(M['extra']['mu-adeq']) or '—'} | — |")
+    print(f"| ISWIM pipeline's modules reused | {c.lines(M['borrowed']['mu-adeq']) or '—'} | — |")
+    print('| **total** | ' + ' | '.join(bold_min([M['total']['mu-adeq'], S['atotal']])) + ' |')
+    print()
+    if S['areused']:
+        print('Reused by the Scott column\'s adequacy: ' + ', '.join(f'{c.display(un)} ({c.ulines(un)})'
+                                                               for un in sorted(S['areused'])) + '.')
+        print()
+    print(f"Theorem statements (FPC/Theorems/ScottDomainsAdequateWrtClockedInterpreters.agda): {S['athm']} {UNIT}.")
+    print()
+    typetopology_report()
+
+
+TT_SOURCE = 'vendor/TypeTopology/source' if ARTIFACT else '_deps/TypeTopology/source'
+# TypeTopology's domain theory and the lifting monad (the mathematics the
+# graph model's own infrastructure plays the role of), against its general
+# foundations (univalent foundations, MLTT, naturals, ...), which play the
+# role the standard library plays for every column and are counted for none
+TT_DOMAIN = ('DomainTheory', 'Lifting')
+
+
+def typetopology_counts():
+    """The TypeTopology modules that the Scott column imports, transitively
+    from agda/AllScott.agda, by top-level directory: the number of modules
+    and their code lines (the code blocks of .lagda files, without comments,
+    blank lines or imports); None when TypeTopology is not there."""
+    if not os.path.isdir(TT_SOURCE):
+        return None
+
+    def find(mod):
+        rel = mod.replace('.', '/')
+        for root in ('agda', TT_SOURCE):
+            for ext in ('.agda', '.lagda'):
+                q = os.path.join(root, rel + ext)
+                if os.path.exists(q):
+                    return q
+        return None
+
+    def code_of(f):
+        t = open(f, encoding='utf-8').read()
+        if f.endswith('.lagda'):
+            t = '\n'.join(re.findall(r'\\begin\{code\}(.*?)\\end\{code\}', t, re.S))
+        return t
+
+    def count(t):
+        t = re.sub(r'\{-.*?-\}', '', t, flags=re.S)
+        n = 0
+        for line in t.split('\n'):
+            line = re.sub(r'--.*', '', line).strip()
+            if line and not re.match(r'(open\s+)?import\b', line):
+                n += measure(line, MEASURE)
+        return n
+
+    seen, todo = {}, [A + 'AllScott.agda']
+    while todo:
+        f = todo.pop()
+        if f in seen:
+            continue
+        seen[f] = code_of(f)
+        for m in re.findall(r'^\s*(?:open\s+)?import\s+([^\s;(){}]+)', seen[f], re.M):
+            q = find(m)
+            if q and q not in seen:
+                todo.append(q)
+    mods, lines_ = {}, {}
+    if ARTIFACT:
+        # the artifact vendors exactly the modules the Scott column imports
+        vendored = {os.path.join(r, n) for r, _, ns in os.walk(TT_SOURCE) for n in ns}
+        found = {f for f in seen if f.startswith(TT_SOURCE)}
+        if vendored != found:
+            sys.exit('the vendored TypeTopology is not the closure of agda/AllScott.agda:\n  '
+                     + '\n  '.join(sorted(vendored ^ found)))
+    for f, t in seen.items():
+        if f.startswith(TT_SOURCE):
+            top = f[len(TT_SOURCE) + 1:].split('/')[0]
+            mods[top] = mods.get(top, 0) + 1
+            lines_[top] = lines_.get(top, 0) + count(t)
+    return mods, lines_
+
+
+def typetopology_report():
+    """The TypeTopology modules that the Scott column imports (see
+    typetopology_counts), domain theory against foundations."""
+    counts = typetopology_counts()
+    if counts is None:
+        print('TypeTopology not fetched (run `make scott-deps`): no breakdown of the imported library.')
+        print()
+        return
+    mods, lines_ = counts
+    dom = sum(lines_.get(k, 0) for k in TT_DOMAIN)
+    found = sum(lines_.values()) - dom
+    print(f'| TypeTopology imported by the Scott column (not in any total) | modules | {UNIT} |')
+    print('|---|---:|---:|')
+    print(f"| domain theory and lifting ({', '.join(TT_DOMAIN)}) | {sum(mods.get(k, 0) for k in TT_DOMAIN)} | {dom} |")
+    print(f"| foundations (the rest: {', '.join(sorted(k for k in lines_ if k not in TT_DOMAIN))}) "
+          f"| {sum(mods.values()) - sum(mods.get(k, 0) for k in TT_DOMAIN)} | {found} |")
+    print(f'| **total** | {sum(mods.values())} | {sum(lines_.values())} |')
+    print()
+    print()
+
+
+def table_numbers(c, M):
+    """The numbers of Tables 1 and 2 in the current measure (MEASURE): the
+    rows of Table 1, its totals, and the rows of Table 2."""
+    S = scott_analyze(c, M)
+    scott = {r: n for r, _, n in S['cells']}
+    rows = []
+    for r in ROWS:
+        ns = []
+        for s in TABLE_ORDER:
+            if s == 'scott':
+                ns.append(scott.get(r))
+                continue
+            n = c.counts.get((s, r))
+            if r == SEM:
+                n = (n or 0) + c.lines(M['extra'][s]) + c.lines(M['borrowed'][s]) or None
+            ns.append(n)
+        if any(n is not None for n in ns):
+            rows.append((r, ns))
+    totals = [S['total'] if s == 'scott' else M['total'][s] for s in TABLE_ORDER]
+    # the infrastructure that each column reaches (as in mu_main), and the
+    # Scott column's (scott_report), with TypeTopology's domain theory
+    infra = {s: 0 for s in MU_SIDES}
+    seen_groups = []
+    for side, gname, _ in GROUPS:
+        if side in ('infra', 'mu-infra', 'mu-rinfra') and (side, gname) not in seen_groups:
+            seen_groups.append((side, gname))
+            us = {unit(f) for f in c.files_of[(side, gname)]}
+            for s in MU_SIDES:
+                infra[s] += c.ilines(us, M['freach'][s])
+    tt = typetopology_counts()
+    if tt is None:
+        sys.exit(f'TypeTopology not found at {TT_SOURCE}')
+    mods, lines_ = tt
+    dom = sum(lines_.get(k, 0) for k in TT_DOMAIN)
+    found = sum(lines_.values()) - dom
+    ours = [S['itotal'] if s == 'scott' else infra[s] for s in TABLE_ORDER]
+    ttd = [dom if s == 'scott' else None for s in TABLE_ORDER]
+    with_infra = [t + o + (d or 0) for t, o, d in zip(totals, ours, ttd)]
+    return dict(rows=rows, totals=totals, ours=ours, ttd=ttd, with_infra=with_infra, found=found)
+
+
+TABLE_ORDER = ['mu-den', 'scott', 'mu-op', 'mu-ck', 'mu-red']
+
+
+def artifact_tables(c, M):
+    """Tables 1 and 2 of the paper: the five correctness proofs, row by row,
+    and the infrastructure each relies on (--artifact), in the current
+    measure (lexical tokens, unless --lines), each with its totals in lines
+    too when the measure is not lines."""
+    global MEASURE
+    cols = ['graph model', 'Scott domains', 'machines', 'interpreters', 'reduction']
+    names = {'CC: capture': 'capture', 'CC: prune': 'prune', 'CC: concretize': 'concretize',
+             'CC: split': 'split closure', 'CC: hoist': 'hoist', 'rco': 'remove complex operands'}
+    N = table_numbers(c, M)
+    L = None
+    if MEASURE != 'lines':
+        # the same tables in lines, for their totals
+        saved, MEASURE = MEASURE, 'lines'
+        c2 = Count()
+        L = table_numbers(c2, mu_analyze(c2))
+        MEASURE = saved
+    print(f'## Table 1: {UNIT} of Agda in the five correctness proofs')
+    print()
+    print('| | ' + ' | '.join(cols) + ' |')
+    print('|---|' + '---:|' * len(cols))
+    for r, ns in N['rows']:
+        print(f'| {names.get(r, r)} | ' + ' | '.join(bold_min(ns)) + ' |')
+    print('| **total** | ' + ' | '.join(bold_min(N['totals'])) + ' |')
+    if L:
+        print('| total in lines | ' + ' | '.join(bold_min(L['totals'])) + ' |')
+    print()
+    print(f'## Table 2: {UNIT} of Agda in the infrastructure that each proof relies on')
+    print()
+    print('| | ' + ' | '.join(cols) + ' |')
+    print('|---|' + '---:|' * len(cols))
+    print('| our infrastructure | ' + ' | '.join(bold_min(N['ours'])) + ' |')
+    print("| TypeTopology's domain theory | "
+          + ' | '.join('—' if n is None else str(n) for n in N['ttd']) + ' |')
+    print('| **total with Table 1** | ' + ' | '.join(bold_min(N['with_infra'])) + ' |')
+    if L:
+        print('| total with Table 1, in lines | ' + ' | '.join(bold_min(L['with_infra'])) + ' |')
+    print()
+    print("Not counted for any column: the Agda standard library and TypeTopology's general "
+          f"foundations ({N['found']} {UNIT}" + (f", {L['found']} lines" if L else '') + ").")
+
+
+def main():
+    global MEASURE, UNIT
+    args = sys.argv[1:]
+    if '--lines' in args:
+        MEASURE = 'lines'
+    elif '--chars' in args:
+        MEASURE = 'chars'
+    UNIT = UNITS[MEASURE]
+    print(f'(All counts below are in {UNIT}.)')
+    print()
+    c = Count()
+    mu_check(c)
+    mu_red_check(c)
+    args = sys.argv[1:]
+    if ARTIFACT:
+        artifact_tables(c, mu_analyze(c))
+        return
+    T, Un = c.analyze(TYPED), c.analyze(UNTYPED)
+    if '--mu-detail' in args:
+        print('## FPC against the ISWIM pipeline, row by row')
+        print()
+        mu_report(c, T)
+        mu_ck_report(c)
+        mu_red_report(c)
+        return
+    if '--untyped' in args:
+        print(f'## The {UNTYPED["name"]}')
+        print()
+        c.print_pipeline(Un)
+        c.errors_infra(UNTYPED)
+        return
+    if '--iswim' in args:
+        print('## The ISWIM pipeline')
+        print()
+        c.print_pipeline(T)
+        c.errors_infra(TYPED)
+        compare(c, T, Un)
+        assurance(c)
+        return
+    M = mu_analyze(c)
+    if '--tables' in args:
+        artifact_tables(c, M)
+        return
+    if '--scott' in args:
+        print('## FPC in Scott domains, against the graph model')
+        print()
+        scott_report(c, M)
+        return
+    X = mixed_analyze(c, M)
+    if '--mixed' in args:
+        print('## Mixing semantics: the graph model and the interpreters')
+        print()
+        mixed_brief(c, M, X)
+        mixed_report(c, M, X)
+        return
+    print('## FPC')
+    print()
+    mu_main(c, T, M)
+    print('## Mixing semantics')
+    print()
+    print('Full tables: --mixed.')
+    print()
+    mixed_brief(c, M, X)
+    if '--mu' in args:
+        return
+    print('## Dynamic typing and errors: the ISWIM pipeline')
+    print()
+    print('Full tables: --iswim (and --untyped for the untyped pipeline; --mu-detail for FPC '
+          'against the ISWIM pipeline, row by row).')
+    print()
+    iswim_brief(c, T, M)
+
+
+if __name__ == '__main__':
+    main()

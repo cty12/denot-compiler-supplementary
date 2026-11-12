@@ -1,0 +1,27 @@
+TypeTopology (vendored subset)
+==============================
+
+This directory holds the modules of TypeTopology that the Scott-domain
+development imports, transitively (agda/AllScott.agda), and nothing else:
+121 of its source files, under source/, at their paths in TypeTopology.
+
+Origin:  https://github.com/martinescardo/TypeTopology
+Commit:  17487fc910f3bb305c30001507fed5d41d52dc3c
+License: see LICENSE (TypeTopology's own, unchanged).
+Authors: Martin Escardo and the TypeTopology contributors; its domain
+         theory (source/DomainTheory/) is by Tom de Jong.
+
+The files are unchanged except that the patch
+typetopology-builtin-alias.patch (in this directory) has been applied to
+them.  It makes TypeTopology's natural numbers, Booleans and lists the
+builtin ones of Agda.Builtin.* (as the standard library's are), and drops
+its NATPLUS and NATTIMES pragmas, so that a module may import both the
+standard library and TypeTopology.  It changes these files:
+
+  source/MLTT/Bool.lagda
+  source/MLTT/List.lagda
+  source/MLTT/Natural-Numbers-Type.lagda
+  source/Naturals/Addition.lagda
+  source/Naturals/Multiplication.lagda
+
+typetopology.agda-lib is TypeTopology's library file, unchanged.

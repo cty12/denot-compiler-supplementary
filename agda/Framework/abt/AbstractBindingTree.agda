@@ -1,0 +1,29 @@
+{-# OPTIONS --without-K #-}
+{- Extracted from a library of abstract binding trees (not named, for
+   anonymous review): just the abstract binding trees themselves. -}
+open import Data.List using (List; []; _∷_)
+open import Relation.Binary.PropositionalEquality using (_≡_; refl)
+open import Framework.abt.Sig
+open import Framework.abt.Var
+
+module Framework.abt.AbstractBindingTree (Op : Set) (sig : Op → List Sig) where
+
+data Args : List Sig → Set
+
+data ABT : Set where
+  `_ : Var → ABT
+  _⦅_⦆ : (op : Op) → Args (sig op) → ABT
+
+data Arg : Sig → Set where
+  ast : ABT → Arg ■
+  bind : ∀{b} → Arg b → Arg (ν b)
+  clear : ∀{b} → Arg b → Arg (∁ b)
+
+data Args where
+  nil : Args []
+  cons : ∀{b bs} → Arg b → Args bs → Args (b ∷ bs)
+
+var-injective : ∀ {x y}
+  → ` x ≡ ` y
+  → x ≡ y
+var-injective refl = refl
