@@ -75,10 +75,10 @@ in Agda's libraries file (as `standard-library`), from this directory:
 * `make check` runs `agda --safe agda/FPC/All.agda` and then
   `make pragma-check`, which fails if any file under `agda/` has a
   `postulate` or a pragma other than `--without-K`.
-`make check-scott` writes `_build/libraries` (Agda's default libraries file plus
-`vendor/TypeTopology/typetopology.agda-lib`) and runs `agda
---library-file=_build/libraries -l standard-library -l TypeTopology -i agda
---safe agda/AllScott.agda`.
+* `make check-scott` writes `_build/libraries` (Agda's default libraries file plus
+  `vendor/TypeTopology/typetopology.agda-lib`) and runs `agda
+  --library-file=_build/libraries -l standard-library -l TypeTopology -i agda
+  --safe agda/AllScott.agda`.
 * `make clean` cleans up Agda's interface files.
 
 ## Checking proofs interactively in Emacs
